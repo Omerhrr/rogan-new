@@ -1,0 +1,121 @@
+version: '3.8'
+
+services:
+  # ─── PostgreSQL ───────────────────────────────────────────────
+  postgres:
+    image: postgres:16-alpine
+    container_name: rogan-postgres
+    environment:
+      POSTGRES_DB: rogan_live
+      POSTGRES_USER: rogan
+      POSTGRES_PASSWORD: rogan_secret
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U rogan -d rogan_live"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  # ─── Redis ────────────────────────────────────────────────────
+  redis:
+    image: redis:7-alpine
+    container_name: rogan-redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redisdata:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  # ─── Alembic Migrations ──────────────────────────────────────
+  alembic-migrate:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: rogan-migrate
+    command: >
+      sh -c "alembic upgrade head"
+    environment:
+      DATABASE_URL: postgresql://rogan:rogan_secret@postgres:5432/rogan_live
+      REDIS_URL: redis://redis:6379/0
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  # ─── FastAPI Backend ─────────────────────────────────────────
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: rogan-backend
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+    ports:
+      - "8000:8000"
+    environment:
+      DATABASE_URL: postgresql://rogan:rogan_secret@postgres:5432/rogan_live
+      REDIS_URL: redis://redis:6379/0
+      JWT_SECRET: ${JWT_SECRET:-rogan-live-production-secret-change-me}
+      GOOGLE_CLIENT_ID: ${GOOGLE_CLIENT_ID:-}
+      GOOGLE_CLIENT_SECRET: ${GOOGLE_CLIENT_SECRET:-}
+      CORS_ORIGINS: '["http://localhost:5173","http://localhost:3000"]'
+      MEDIAMTX_HOST: mediamtx
+    volumes:
+      - ./backend:/app
+    depends_on:
+      alembic-migrate:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+
+  # ─── Next.js Frontend ────────────────────────────────────────
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile.dev
+    container_name: rogan-frontend
+    ports:
+      - "5173:5173"
+    environment:
+      NEXT_PUBLIC_API_URL: http://backend:8000
+      NEXT_PUBLIC_WS_URL: ws://backend:8000
+      NEXT_PUBLIC_MEDIAMTX_URL: http://mediamtx:8888
+    volumes:
+      - ./frontend/src:/app/src
+      - ./frontend/public:/app/public
+    depends_on:
+      backend:
+        condition: service_healthy
+
+  # ─── MediaMTX (RTMP → LL-HLS + WebRTC) ──────────────────────
+  mediamtx:
+    image: bluenviron/mediamtx:v1.19.0
+    container_name: rogan-mediamtx
+    ports:
+      - "1935:1935"   # RTMP ingest
+      - "8888:8888"   # LL-HLS
+      - "8889:8889"   # WebRTC
+      - "9997:9997"   # API
+    volumes:
+      - ./backend/config/mediamtx.yml:/mediamtx.yml:ro
+      - mediamtxdata:/mediamtx-recordings
+    depends_on:
+      - backend
+
+volumes:
+  pgdata:
+  redisdata:
+  mediamtxdata:

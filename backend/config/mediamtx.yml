@@ -1,0 +1,72 @@
+###############################################
+# Rogan Live — MediaMTX Configuration
+# Compatible with MediaMTX v1.19.0+
+# RTMP ingest + LL-HLS + WebRTC
+###############################################
+
+# General settings
+logLevel: info
+logDestinations: [stdout]
+
+# Authentication — external webhook via our FastAPI backend
+authMethod: http
+authHTTPAddress: http://backend:8000/api/v1/mediamtx/auth
+# Exclude API/metrics from external auth (they use internal auth)
+authHTTPExclude:
+  - action: api
+  - action: metrics
+  - action: pprof
+
+# Internal auth — allow read access for viewers without login
+authInternalUsers:
+  - user: any
+    pass:
+    ips: []
+    permissions:
+      - action: read
+        path:
+      - action: playback
+        path:
+
+# API server (for management / metrics)
+api: true
+apiAddress: :9997
+
+# RTMP server — primary ingest point
+rtmp: true
+rtmpAddress: :1935
+
+# LL-HLS (Low-Latency HLS) — viewer playback
+hls: true
+hlsAddress: :8888
+hlsAlwaysRemux: true
+hlsVariant: lowLatency
+hlsSegmentCount: 7
+hlsSegmentDuration: 1s
+hlsPartDuration: 200ms
+
+# WebRTC — ultra-low-latency viewer playback
+webrtc: true
+webrtcAddress: :8889
+
+# Default path settings
+pathDefaults:
+  # Source is RTMP ingest from creators
+  source: publisher
+  sourceOnDemand: false
+  # Recording settings
+  record: true
+  recordPath: ./recordings/%path/%Y-%m-%d_%H-%M-%S-%f
+  recordFormat: fmp4
+  recordPartDuration: 1s
+  recordSegmentDuration: 10m
+
+# Path configuration — stream key based routing
+# Creators publish to rl_{stream_key}
+# Viewers consume the same path
+paths:
+  ~^rl_:
+    source: publisher
+    sourceOnDemand: false
+    record: true
+    recordPath: ./recordings/%path/%Y-%m-%d_%H-%M-%S-%f
