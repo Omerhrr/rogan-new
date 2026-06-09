@@ -42,10 +42,12 @@ export class StreamWSClient {
     if (this.intentionalClose) return;
     if (this.reconnectAttempts >= this.maxReconnectAttempts) return;
 
-    const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-    // Always connect through the Next.js server (which proxies /ws/ to the backend)
-    // NEXT_PUBLIC_WS_URL is for server-side rendering only
-    const wsBase = `${protocol}//${window.location.host}`;
+    // Connect directly to the backend WebSocket server.
+    // Next.js rewrites cannot proxy WebSocket upgrade requests,
+    // so the browser must connect to the backend directly.
+    // NEXT_PUBLIC_WS_URL should be set to e.g. "ws://localhost:8000" (Docker)
+    // or "wss://yourdomain.com" (production reverse proxy).
+    const wsBase = process.env.NEXT_PUBLIC_WS_URL || 'ws://localhost:8000';
     const url = `${wsBase}/ws/${this.options.streamId}/${this.options.userId}?token=${this.options.token}`;
 
     try {

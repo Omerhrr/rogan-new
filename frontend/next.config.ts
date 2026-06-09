@@ -8,10 +8,10 @@ const nextConfig: NextConfig = {
         source: '/api/v1/:path*',
         destination: `${process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000'}/api/v1/:path*`,
       },
-      {
-        source: '/ws/:path*',
-        destination: `${process.env.NEXT_PUBLIC_WS_URL || 'ws://localhost:8000'}/ws/:path*`,
-      },
+      // NOTE: WebSocket connections go directly from browser to backend.
+      // Next.js rewrites do NOT support ws:// destinations, and cannot
+      // proxy WebSocket upgrade requests. The frontend WS client connects
+      // directly to the backend using NEXT_PUBLIC_WS_URL.
       {
         source: '/live/:path*',
         destination: `${process.env.NEXT_PUBLIC_MEDIAMTX_URL || 'http://localhost:8888'}/:path*`,

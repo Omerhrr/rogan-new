@@ -1,5 +1,3 @@
-version: '3.8'
-
 services:
   # ─── PostgreSQL ───────────────────────────────────────────────
   postgres:
@@ -65,7 +63,7 @@ services:
       JWT_SECRET: ${JWT_SECRET:-rogan-live-production-secret-change-me}
       GOOGLE_CLIENT_ID: ${GOOGLE_CLIENT_ID:-}
       GOOGLE_CLIENT_SECRET: ${GOOGLE_CLIENT_SECRET:-}
-      CORS_ORIGINS: '["http://localhost:5173","http://localhost:3000"]'
+      CORS_ORIGINS: '["http://localhost:5173","http://localhost:3000","http://localhost:8000"]'
       MEDIAMTX_HOST: mediamtx
     volumes:
       - ./backend:/app
@@ -91,7 +89,7 @@ services:
       - "5173:5173"
     environment:
       NEXT_PUBLIC_API_URL: http://backend:8000
-      NEXT_PUBLIC_WS_URL: ws://backend:8000
+      NEXT_PUBLIC_WS_URL: ws://localhost:8000
       NEXT_PUBLIC_MEDIAMTX_URL: http://mediamtx:8888
     volumes:
       - ./frontend/src:/app/src
