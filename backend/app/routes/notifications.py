@@ -15,7 +15,7 @@ from app.services import notification_service
 router = APIRouter(prefix="/notifications", tags=["Notifications"])
 
 
-@router.get("/")
+@router.get("")
 def get_notifications(
     page: int = Query(1, ge=1),
     limit: int = Query(20, ge=1, le=100),
@@ -58,6 +58,19 @@ def get_unread_count(
     """Get unread notification count (auth required)."""
     count = notification_service.get_unread_count(db=db, user_id=current_user.id)
     return {"unread_count": count}
+
+
+@router.post("/read-all")
+def mark_all_notifications_read(
+    current_user: User = Depends(get_current_user_dependency),
+    db: Session = Depends(get_db),
+):
+    """Mark all notifications as read for the current user."""
+    count = notification_service.mark_all_notifications_read(
+        db=db,
+        user_id=current_user.id,
+    )
+    return {"marked_read": count, "message": f"{count} notifications marked as read"}
 
 
 @router.post("/{notification_id}/read")

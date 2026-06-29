@@ -342,9 +342,13 @@ def verify_product_access(db: Session, product_id: str, user_id: str) -> bool:
 
 
 def _invalidate_product_cache():
-    """Invalidate all product search caches."""
+    """Invalidate all product search caches.
+    FIX: redis_client.delete("products:*") treats the argument as a literal key
+    name, not a glob pattern. Use keys() to find matching keys first.
+    """
     try:
-        # Best-effort cache invalidation
-        redis_client.delete("products:*")
+        keys = redis_client.keys("products:*")
+        if keys:
+            redis_client.delete(*keys)
     except Exception:
         pass

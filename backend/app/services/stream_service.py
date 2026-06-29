@@ -8,9 +8,15 @@ from datetime import datetime
 from typing import Any, Dict, Optional
 
 from fastapi import HTTPException, status
+from sqlalchemy import func
 from sqlalchemy.orm import Session
 
-from app.models.models import Stream, User
+from app.models.models import Stream, User, PrivateShow
+
+# Hard cap on per-creator stream records to prevent unbounded DB growth.
+# Old non-live streams accumulate every time a creator goes live (each session
+# creates a new Stream row). 100 is generous for any real creator.
+_MAX_STREAMS_PER_CREATOR = 100
 
 
 def create_stream(
@@ -28,6 +34,22 @@ def create_stream(
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="User not found",
+        )
+
+    # Guard against unbounded stream record accumulation (each Go Live creates a new row).
+    stream_count = (
+        db.query(func.count(Stream.id))
+        .filter(Stream.creator_id == creator_id)
+        .scalar()
+        or 0
+    )
+    if stream_count >= _MAX_STREAMS_PER_CREATOR:
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail=(
+                f"Stream record limit reached ({_MAX_STREAMS_PER_CREATOR}). "
+                "Delete old streams before creating new ones."
+            ),
         )
 
     stream_key = str(uuid.uuid4())
@@ -65,6 +87,18 @@ def go_live(db: Session, stream_id: str) -> Stream:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Stream is already live",
+        )
+
+    # Prevent creator from running multiple concurrent live streams
+    existing_live = (
+        db.query(Stream)
+        .filter(Stream.creator_id == stream.creator_id, Stream.is_live == True, Stream.id != stream_id)
+        .first()
+    )
+    if existing_live:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="You already have an active live stream. End it before starting a new one.",
         )
 
     stream.is_live = True
@@ -136,6 +170,7 @@ def get_live_streams(db: Session, page: int = 1, limit: int = 20) -> Dict[str, A
             "is_private": stream.is_private,
             "viewer_count": stream.viewer_count,
             "category": stream.category,
+            "stream_key": stream.stream_key,  # needed by frontend for thumbnail URL
             "created_at": stream.created_at.isoformat() if stream.created_at else None,
             "creator": {
                 "id": creator.id,
@@ -143,7 +178,15 @@ def get_live_streams(db: Session, page: int = 1, limit: int = 20) -> Dict[str, A
                 "display_name": creator.display_name,
                 "avatar": creator.avatar,
             } if creator else None,
+            "active_private_show_id": stream.active_private_show_id,
+            "private_show_price": None,
+            "private_show_status": None,
         }
+        if stream.active_private_show_id:
+            ps = db.query(PrivateShow).filter(PrivateShow.id == stream.active_private_show_id).first()
+            if ps and ps.status in ('announced', 'live'):
+                stream_dict["private_show_price"] = ps.price_tk
+                stream_dict["private_show_status"] = ps.status
         result.append(stream_dict)
 
     return {
@@ -166,13 +209,24 @@ def get_stream(db: Session, stream_id: str) -> Dict[str, Any]:
 
     creator = db.query(User).filter(User.id == stream.creator_id).first()
 
+    # hls_url is a root-relative path so the browser fetches it through the
+    # Next.js /live/* → mediamtx:8888 proxy (same origin → no CORS).
+    # Using an absolute http://localhost:8888/... URL would be blocked by CORS
+    # when hls.js makes XHR requests from the frontend origin.
+    hls_url = (
+        f"/live/{stream.stream_key}/index.m3u8"
+        if stream.stream_key and stream.is_live
+        else None
+    )
+
     return {
         "id": stream.id,
         "creator_id": stream.creator_id,
         "title": stream.title,
         "description": stream.description,
         "thumbnail": stream.thumbnail,
-        "stream_key": stream.stream_key,
+        "stream_key": stream.stream_key,  # stripped for non-creators in route layer
+        "hls_url": hls_url,               # public HLS playback URL (always included)
         "is_live": stream.is_live,
         "is_private": stream.is_private,
         "viewer_count": stream.viewer_count,
@@ -215,5 +269,4 @@ def decrement_viewers(db: Session, stream_id: str) -> int:
 
     stream.viewer_count = max((stream.viewer_count or 0) - 1, 0)
     db.commit()
-    db.refresh(stream)
-    return stream.viewer_count
+    return stream

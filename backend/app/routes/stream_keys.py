@@ -18,7 +18,7 @@ from app.services import stream_key_service
 router = APIRouter(prefix="/stream-keys", tags=["Stream Keys"])
 
 
-@router.post("/", status_code=status.HTTP_201_CREATED)
+@router.post("", status_code=status.HTTP_201_CREATED)  # no trailing slash — avoids 307 from Next.js rewrite
 def create_stream_key(
     req: StreamKeyCreate,
     current_user: User = Depends(get_current_user_dependency),

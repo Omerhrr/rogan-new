@@ -66,7 +66,7 @@ export const useStreamStore = create<StreamState>()((set, get) => ({
   createStream: async (data: CreateStreamRequest) => {
     set({ isLoading: true, error: null });
     try {
-      const res = await api.post<Stream>('/streams/', data);
+      const res = await api.post<Stream>('/streams', data);
       set({ currentStream: res.data, isLoading: false });
       return res.data;
     } catch (err) {
@@ -77,14 +77,16 @@ export const useStreamStore = create<StreamState>()((set, get) => ({
 
   goLive: async (streamId: string) => {
     try {
-      const res = await api.post(`/streams/${streamId}/go-live`);
+      await api.post(`/streams/${streamId}/go-live`);
       set((state) => ({
         currentStream: state.currentStream
           ? { ...state.currentStream, is_live: true }
           : null,
       }));
     } catch (err) {
-      throw new Error(getErrorMessage(err));
+      // Re-throw original error (not wrapped) so callers can inspect
+      // err.response.status (e.g. 409 Conflict when already live).
+      throw err;
     }
   },
 

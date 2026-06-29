@@ -15,7 +15,9 @@ interface NotificationState {
   fetchNotifications: () => Promise<void>;
   fetchUnreadCount: () => Promise<void>;
   markAsRead: (id: string) => Promise<void>;
+  markAllAsRead: () => Promise<void>;
   clearError: () => void;
+  incrementUnread: () => void;
 }
 
 export const useNotificationStore = create<NotificationState>()((set) => ({
@@ -27,7 +29,7 @@ export const useNotificationStore = create<NotificationState>()((set) => ({
   fetchNotifications: async () => {
     set({ isLoading: true, error: null });
     try {
-      const res = await api.get('/notifications/');
+      const res = await api.get('/notifications');
       const notifs = (res.data.notifications || res.data || []) as Notification[];
       set({ notifications: notifs, isLoading: false });
     } catch (err) {
@@ -38,7 +40,8 @@ export const useNotificationStore = create<NotificationState>()((set) => ({
   fetchUnreadCount: async () => {
     try {
       const res = await api.get('/notifications/unread-count');
-      set({ unreadCount: res.data.count || 0 });
+      // Backend returns { unread_count: N } — not "count"
+      set({ unreadCount: res.data.unread_count || 0 });
     } catch {
       // Silent
     }
@@ -53,10 +56,24 @@ export const useNotificationStore = create<NotificationState>()((set) => ({
         ),
         unreadCount: Math.max(0, state.unreadCount - 1),
       }));
-    } catch {
-      // Silent
+    } catch (err) {
+      set({ error: getErrorMessage(err) });
+    }
+  },
+
+  markAllAsRead: async () => {
+    try {
+      await api.post('/notifications/read-all');
+      set((state) => ({
+        notifications: state.notifications.map((n) => ({ ...n, is_read: true })),
+        unreadCount: 0,
+      }));
+    } catch (err) {
+      set({ error: getErrorMessage(err) });
     }
   },
 
   clearError: () => set({ error: null }),
+
+  incrementUnread: () => set((state) => ({ unreadCount: state.unreadCount + 1 })),
 }));

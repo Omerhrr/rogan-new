@@ -6,18 +6,35 @@ Request/response models for all API endpoints.
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, EmailStr, Field, field_validator
+import re
 
 
 # ─── Auth Schemas ────────────────────────────────────────────────
 
+def _validate_password_strength(v: str) -> str:
+    """Shared password strength validator: min 8 chars + uppercase + lowercase + digit."""
+    if not re.search(r'[A-Z]', v):
+        raise ValueError('Password must contain at least one uppercase letter')
+    if not re.search(r'[a-z]', v):
+        raise ValueError('Password must contain at least one lowercase letter')
+    if not re.search(r'\d', v):
+        raise ValueError('Password must contain at least one digit')
+    return v
+
+
 class RegisterRequest(BaseModel):
-    email: str
-    username: str = Field(..., min_length=3, max_length=30)
-    password: str = Field(..., min_length=6)
+    email: EmailStr  # validates format (requires pydantic[email] / email-validator)
+    username: str = Field(..., min_length=3, max_length=30, pattern=r'^[a-zA-Z0-9_]+$')
+    password: str = Field(..., min_length=8)
+
+    @field_validator('password')
+    @classmethod
+    def password_strength(cls, v: str) -> str:
+        return _validate_password_strength(v)
 
 class LoginRequest(BaseModel):
-    email: str
+    email: EmailStr
     password: str
 
 class GoogleAuthRequest(BaseModel):
@@ -27,6 +44,18 @@ class UpdateProfileRequest(BaseModel):
     display_name: Optional[str] = Field(None, max_length=100)
     bio: Optional[str] = Field(None, max_length=500)
     avatar: Optional[str] = None
+
+class ForgotPasswordRequest(BaseModel):
+    email: EmailStr
+
+class ResetPasswordRequest(BaseModel):
+    token: str = Field(..., min_length=1)
+    new_password: str = Field(..., min_length=8)
+
+    @field_validator('new_password')
+    @classmethod
+    def new_password_strength(cls, v: str) -> str:
+        return _validate_password_strength(v)
 
 class UserResponse(BaseModel):
     id: str
@@ -105,7 +134,16 @@ class SendGiftResponse(BaseModel):
 # ─── Wallet Schemas ──────────────────────────────────────────────
 
 class LinkWalletRequest(BaseModel):
-    wallet_address: str = Field(..., min_length=10)
+    wallet_address: str = Field(..., min_length=42, max_length=42)
+
+    @field_validator('wallet_address')
+    @classmethod
+    def validate_eth_address(cls, v: str) -> str:
+        if not re.match(r'^0x[0-9a-fA-F]{40}$', v):
+            raise ValueError(
+                'Invalid Ethereum wallet address — must be 0x followed by 40 hex characters'
+            )
+        return v
 
 class DepositRequest(BaseModel):
     amount: float = Field(..., gt=0)
@@ -361,7 +399,11 @@ class DMConversationResponse(BaseModel):
         from_attributes = True
 
 class DMMessageCreate(BaseModel):
-    content: str = Field(..., min_length=1, max_length=5000)
+    content: Optional[str] = Field(None, max_length=5000)
+    reply_to_id: Optional[str] = None
+    message_type: Optional[str] = 'text'  # 'text' | 'voice'
+    audio_url: Optional[str] = None
+    audio_duration: Optional[float] = None
 
 class DMMessageResponse(BaseModel):
     id: str
@@ -372,6 +414,7 @@ class DMMessageResponse(BaseModel):
     amount_tk: Optional[float] = None
     read_at: Optional[datetime] = None
     created_at: Optional[datetime] = None
+    reply_to_id: Optional[str] = None
 
     class Config:
         from_attributes = True

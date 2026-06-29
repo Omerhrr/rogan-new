@@ -10,10 +10,11 @@ publishers and track stream lifecycle events.
 
 import json
 import logging
+import secrets
 from datetime import datetime
 from typing import Any, Dict, Optional
 
-from fastapi import APIRouter, Depends, Request, status
+from fastapi import APIRouter, Depends, Header, HTTPException, Request, status
 from sqlalchemy.orm import Session
 
 from app.config import settings
@@ -27,10 +28,30 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/mediamtx", tags=["MediaMTX"])
 
 
+def _verify_webhook_secret(x_webhook_secret: Optional[str] = Header(None)) -> None:
+    """Verify the shared secret on MediaMTX webhook calls.
+
+    MediaMTX is configured to send X-Webhook-Secret header.
+    If MEDIAMTX_WEBHOOK_SECRET is set in config, it must match.
+    If empty (dev mode), the check is skipped with a warning.
+    """
+    expected = settings.MEDIAMTX_WEBHOOK_SECRET
+    if not expected:
+        # No secret configured — skip check (dev only; warn in production).
+        logger.warning("MEDIAMTX_WEBHOOK_SECRET is not set — webhook endpoint is unprotected!")
+        return
+    if not x_webhook_secret or not secrets.compare_digest(x_webhook_secret, expected):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Invalid webhook secret",
+        )
+
+
 @router.post("/auth")
 def mediamtx_auth(
     req: MediaMTXAuthRequest,
     db: Session = Depends(get_db),
+    _: None = Depends(_verify_webhook_secret),
 ):
     """Auth webhook for RTMP ingest. Validates the stream key from the publish path.
 
@@ -53,6 +74,7 @@ def mediamtx_auth(
 async def mediamtx_rtmp_publish(
     request: Request,
     db: Session = Depends(get_db),
+    _: None = Depends(_verify_webhook_secret),
 ):
     """Handle RTMP publish start event from MediaMTX.
 
@@ -72,24 +94,32 @@ async def mediamtx_rtmp_publish(
     if not key_str:
         return {"status": "ignored", "reason": "No valid key in path"}
 
+    # Resolve creator_id from either StreamKey table or Stream.stream_key
+    creator_id: Optional[str] = None
     stream_key_record = (
         db.query(StreamKey)
         .filter(StreamKey.key == key_str, StreamKey.is_active == True)
         .first()
     )
+    if stream_key_record:
+        creator_id = stream_key_record.user_id
+    else:
+        existing_stream = db.query(Stream).filter(Stream.stream_key == key_str).first()
+        if existing_stream:
+            creator_id = existing_stream.creator_id
 
-    if not stream_key_record:
+    if not creator_id:
         return {"status": "ignored", "reason": "Stream key not found or inactive"}
 
     # Find or create the stream record
-    stream = _get_or_create_stream(db, stream_key_record.user_id, key_str)
+    stream = _get_or_create_stream(db, creator_id, key_str)
     if stream:
         stream.is_live = True
         stream.ended_at = None
         db.commit()
 
         # Set creator is_live flag
-        creator = db.query(User).filter(User.id == stream_key_record.user_id).first()
+        creator = db.query(User).filter(User.id == creator_id).first()
         if creator:
             creator.is_live = True
             db.commit()
@@ -97,7 +127,7 @@ async def mediamtx_rtmp_publish(
     # Publish stream start event via Redis
     _publish_stream_event("stream_start", {
         "stream_id": stream.id if stream else None,
-        "creator_id": stream_key_record.user_id,
+        "creator_id": creator_id,
         "stream_key": key_str,
         "path": path,
     })
@@ -109,6 +139,7 @@ async def mediamtx_rtmp_publish(
 async def mediamtx_rtmp_unpublish(
     request: Request,
     db: Session = Depends(get_db),
+    _: None = Depends(_verify_webhook_secret),
 ):
     """Handle RTMP unpublish (stream end) event from MediaMTX.
 
@@ -162,6 +193,10 @@ async def mediamtx_rtmp_unpublish(
 def _authenticate_publish(db: Session, req: MediaMTXAuthRequest) -> MediaMTXAuthResponse:
     """Authenticate a publish request by validating the stream key in the path.
 
+    Checks two sources in order:
+    1. StreamKey table — OBS / manually generated keys
+    2. Stream.stream_key — auto-generated keys from webcam/GoLive flow
+
     Args:
         db: Database session.
         req: The MediaMTX auth request payload.
@@ -175,49 +210,48 @@ def _authenticate_publish(db: Session, req: MediaMTXAuthRequest) -> MediaMTXAuth
     if not key_str:
         return MediaMTXAuthResponse(ok=False, error="Invalid stream path format")
 
-    # Look up the stream key in the database
+    # 1. Check StreamKey table (OBS / manually issued keys)
     stream_key = (
         db.query(StreamKey)
         .filter(StreamKey.key == key_str, StreamKey.is_active == True)
         .first()
     )
+    if stream_key:
+        stream_key.last_used_at = datetime.utcnow()
+        db.commit()
+        return MediaMTXAuthResponse(ok=True)
 
-    if not stream_key:
-        return MediaMTXAuthResponse(ok=False, error="Invalid or revoked stream key")
+    # 2. Check Stream.stream_key (webcam/auto-created streams)
+    stream = (
+        db.query(Stream)
+        .filter(Stream.stream_key == key_str)
+        .first()
+    )
+    if stream:
+        return MediaMTXAuthResponse(ok=True)
 
-    # Update last_used_at
-    stream_key.last_used_at = datetime.utcnow()
-    db.commit()
-
-    return MediaMTXAuthResponse(ok=True)
+    return MediaMTXAuthResponse(ok=False, error="Invalid or revoked stream key")
 
 
 def _extract_key_from_path(path: str) -> Optional[str]:
     """Extract the stream key from a MediaMTX path.
 
-    Paths are formatted as: /rl_{stream_key} or rl_{stream_key}
-    The stream key itself starts with rl_ and contains 32 hex chars.
+    Accepts two formats:
+      - Plain UUID: /a9050bc6-1234-5678-abcd-000000000000
+      - Legacy rl_ prefix: /rl_<hexchars>
 
-    Args:
-        path: The stream path string.
-
-    Returns:
-        The stream key string or None if the path doesn't match the pattern.
+    Returns the first path segment (the stream key), or None if the
+    path is empty or too short to be meaningful.
     """
     if not path:
         return None
 
-    # Strip leading slash
-    clean_path = path.lstrip("/")
+    # Take only the first path segment (strip leading slash, drop sub-paths)
+    first_segment = path.lstrip("/").split("/")[0].strip()
+    if len(first_segment) < 4:
+        return None
 
-    # Check if it starts with rl_ prefix
-    if clean_path.startswith("rl_"):
-        # The key is the entire path segment (rl_ + 32 hex chars)
-        key_part = clean_path.split("/")[0]  # Take only the first path segment
-        if len(key_part) >= 5:  # rl_ + at least 2 chars
-            return key_part
-
-    return None
+    return first_segment
 
 
 def _get_or_create_stream(db: Session, creator_id: str, stream_key_str: str) -> Optional[Stream]:

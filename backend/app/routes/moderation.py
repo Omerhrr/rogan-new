@@ -6,6 +6,7 @@ Reports, ban/mute, auto-moderation, admin actions.
 from typing import Any, Dict, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
+from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
 from app.database import get_db
@@ -21,6 +22,26 @@ from app.schemas import (
     MuteRequest,
 )
 from app.services import moderation_service
+
+
+class SuspendRequest(BaseModel):
+    reason: str
+    duration_minutes: Optional[int] = None  # None = permanent
+
+
+class AppealRequest(BaseModel):
+    reason: str
+    ban_id: Optional[str] = None
+
+
+class AppealReviewRequest(BaseModel):
+    approved: bool
+    reviewer_note: Optional[str] = None
+
+
+class StreamBanRequest(BaseModel):
+    viewer_id: str
+    reason: Optional[str] = None
 
 router = APIRouter(prefix="/moderation", tags=["Moderation"])
 
@@ -56,7 +77,7 @@ def create_report(
     }
 
 
-@router.get("/reports/")
+@router.get("/reports")
 def list_reports(
     status_filter: Optional[str] = Query(None, alias="status"),
     page: int = Query(1, ge=1),
@@ -65,10 +86,10 @@ def list_reports(
     db: Session = Depends(get_db),
 ):
     """Admin gets pending reports (pagination, priority sorting)."""
-    if current_user.role != "admin":
+    if current_user.role not in ("admin", "moderator"):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
-            detail="Only admins can view reports",
+            detail="Admin or moderator access required",
         )
 
     return moderation_service.get_pending_reports(
@@ -87,10 +108,10 @@ def take_action(
     db: Session = Depends(get_db),
 ):
     """Admin takes action on a report (warn/mute/ban/dismiss)."""
-    if current_user.role != "admin":
+    if current_user.role not in ("admin", "moderator"):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
-            detail="Only admins can take moderation actions",
+            detail="Admin or moderator access required",
         )
 
     return moderation_service.take_action(
@@ -169,7 +190,7 @@ def mute_user(
     }
 
 
-@router.get("/banned/")
+@router.get("/banned")
 def list_banned_users(
     page: int = Query(1, ge=1),
     limit: int = Query(20, ge=1, le=100),
@@ -184,6 +205,199 @@ def list_banned_users(
         )
 
     return moderation_service.get_banned_users(db=db, page=page, limit=limit)
+
+
+# ─── My Ban / Appeal status ──────────────────────────────────────
+
+@router.get("/my-ban")
+def my_ban_status(
+    current_user: User = Depends(get_current_user_dependency),
+    db: Session = Depends(get_db),
+):
+    """Return the caller's active ban (if any) and their most recent appeal."""
+    from app.models.models import UserBan, Appeal
+    from datetime import datetime
+
+    now = datetime.utcnow()
+    active_ban = (
+        db.query(UserBan)
+        .filter(
+            UserBan.user_id == current_user.id,
+            UserBan.is_active == True,
+            UserBan.ban_type.in_(["full_ban", "live_suspend"]),
+        )
+        .filter(
+            (UserBan.expires_at == None) | (UserBan.expires_at > now)
+        )
+        .order_by(UserBan.created_at.desc())
+        .first()
+    )
+
+    latest_appeal = (
+        db.query(Appeal)
+        .filter(Appeal.user_id == current_user.id)
+        .order_by(Appeal.created_at.desc())
+        .first()
+    ) if active_ban else None
+
+    return {
+        "ban": {
+            "id": active_ban.id,
+            "ban_type": active_ban.ban_type,
+            "reason": active_ban.reason,
+            "expires_at": active_ban.expires_at.isoformat() if active_ban.expires_at else None,
+        } if active_ban else None,
+        "appeal": {
+            "id": latest_appeal.id,
+            "status": latest_appeal.status,
+            "reason": latest_appeal.reason,
+            "reviewer_note": latest_appeal.reviewer_note,
+        } if latest_appeal else None,
+    }
+
+
+# ─── Force-Stop Stream ────────────────────────────────────────────
+
+@router.post("/reports/{report_id}/force-stop")
+def force_stop_stream(
+    report_id: str,
+    current_user: User = Depends(get_current_user_dependency),
+    db: Session = Depends(get_db),
+):
+    """Mod force-stops the live stream in a stream report."""
+    if current_user.role not in ("admin", "moderator"):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Moderator access required")
+    return moderation_service.force_stop_stream(db=db, report_id=report_id, mod_id=current_user.id)
+
+
+# ─── Suspend / Lift ───────────────────────────────────────────────
+
+@router.post("/suspend/{user_id}")
+def suspend_user(
+    user_id: str,
+    req: SuspendRequest,
+    current_user: User = Depends(get_current_user_dependency),
+    db: Session = Depends(get_db),
+):
+    """Moderator suspends a creator from going live (live_suspend)."""
+    if current_user.role not in ("admin", "moderator"):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Moderator access required")
+    ban = moderation_service.suspend_user(db=db, user_id=user_id, reason=req.reason, duration_minutes=req.duration_minutes)
+    return {
+        "id": ban.id,
+        "user_id": ban.user_id,
+        "ban_type": ban.ban_type,
+        "reason": ban.reason,
+        "expires_at": ban.expires_at.isoformat() if ban.expires_at else None,
+        "message": "User live-suspended",
+    }
+
+
+@router.post("/lift/{user_id}")
+def lift_ban(
+    user_id: str,
+    current_user: User = Depends(get_current_user_dependency),
+    db: Session = Depends(get_db),
+):
+    """Moderator lifts all active bans/suspensions for a user."""
+    if current_user.role not in ("admin", "moderator"):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Moderator access required")
+    return moderation_service.lift_ban(db=db, user_id=user_id)
+
+
+# ─── Appeals ──────────────────────────────────────────────────────
+
+@router.post("/appeals", status_code=201)
+def submit_appeal(
+    req: AppealRequest,
+    current_user: User = Depends(get_current_user_dependency),
+    db: Session = Depends(get_db),
+):
+    """Creator/user submits an appeal against a ban or suspension."""
+    appeal = moderation_service.submit_appeal(
+        db=db, user_id=current_user.id, reason=req.reason, ban_id=req.ban_id
+    )
+    return {
+        "id": appeal.id,
+        "user_id": appeal.user_id,
+        "ban_id": appeal.ban_id,
+        "reason": appeal.reason,
+        "status": appeal.status,
+        "created_at": appeal.created_at.isoformat() if appeal.created_at else None,
+    }
+
+
+@router.get("/appeals")
+def list_appeals(
+    status_filter: Optional[str] = Query(None, alias="status"),
+    page: int = Query(1, ge=1),
+    limit: int = Query(20, ge=1, le=100),
+    current_user: User = Depends(get_current_user_dependency),
+    db: Session = Depends(get_db),
+):
+    """Moderator views submitted appeals."""
+    if current_user.role not in ("admin", "moderator"):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Moderator access required")
+    return moderation_service.get_appeals(db=db, status_filter=status_filter, page=page, limit=limit)
+
+
+@router.post("/appeals/{appeal_id}/review")
+def review_appeal(
+    appeal_id: str,
+    req: AppealReviewRequest,
+    current_user: User = Depends(get_current_user_dependency),
+    db: Session = Depends(get_db),
+):
+    """Moderator approves or rejects an appeal."""
+    if current_user.role not in ("admin", "moderator"):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Moderator access required")
+    return moderation_service.review_appeal(
+        db=db,
+        appeal_id=appeal_id,
+        reviewer_id=current_user.id,
+        approved=req.approved,
+        reviewer_note=req.reviewer_note,
+    )
+
+
+# ─── Stream Bans (creator bans viewer from their stream) ──────────
+
+@router.post("/stream-ban")
+def ban_viewer(
+    req: StreamBanRequest,
+    current_user: User = Depends(get_current_user_dependency),
+    db: Session = Depends(get_db),
+):
+    """Creator bans a viewer from their stream."""
+    if current_user.role not in ("creator", "admin"):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Creator access required")
+    ban = moderation_service.ban_viewer_from_stream(
+        db=db, creator_id=current_user.id, viewer_id=req.viewer_id, reason=req.reason
+    )
+    return {"id": ban.id, "banned_user_id": ban.banned_user_id, "message": "Viewer banned from your stream"}
+
+
+@router.delete("/stream-ban/{viewer_id}")
+def unban_viewer(
+    viewer_id: str,
+    current_user: User = Depends(get_current_user_dependency),
+    db: Session = Depends(get_db),
+):
+    """Creator lifts a stream ban on a viewer."""
+    if current_user.role not in ("creator", "admin"):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Creator access required")
+    return moderation_service.unban_viewer_from_stream(db=db, creator_id=current_user.id, viewer_id=viewer_id)
+
+
+@router.get("/stream-bans")
+def list_stream_bans(
+    current_user: User = Depends(get_current_user_dependency),
+    db: Session = Depends(get_db),
+):
+    """Creator gets list of viewers they've banned from their stream."""
+    if current_user.role not in ("creator", "admin"):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Creator access required")
+    return {"banned": moderation_service.get_stream_banned_viewers(db=db, creator_id=current_user.id)}
 
 
 # ─── Auto-Moderation ──────────────────────────────────────────────

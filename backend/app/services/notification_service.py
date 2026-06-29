@@ -94,3 +94,14 @@ def get_unread_count(db: Session, user_id: str) -> int:
         .filter(Notification.user_id == user_id, Notification.is_read == False)
         .scalar()
     )
+
+
+def mark_all_notifications_read(db: Session, user_id: str) -> int:
+    """Mark all unread notifications as read for a user. Returns the count updated."""
+    updated = (
+        db.query(Notification)
+        .filter(Notification.user_id == user_id, Notification.is_read == False)
+        .update({"is_read": True}, synchronize_session=False)
+    )
+    db.commit()
+    return updated

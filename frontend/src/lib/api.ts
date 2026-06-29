@@ -48,10 +48,21 @@ api.interceptors.response.use(
 );
 
 // ─── Helper: Extract error message ───────────────────────────
+// FastAPI can return detail as a string OR as a Pydantic validation array:
+// [{type, loc, msg, input, ctx}, ...]
+// We must always return a plain string so React never renders an object.
 export function getErrorMessage(error: unknown): string {
   if (axios.isAxiosError(error)) {
-    const data = error.response?.data as { detail?: string; message?: string } | undefined;
-    return data?.detail || data?.message || error.message || 'An error occurred';
+    const data = error.response?.data as {
+      detail?: string | Array<{ msg?: string; loc?: string[]; type?: string }>;
+      message?: string;
+    } | undefined;
+    const detail = data?.detail;
+    if (Array.isArray(detail)) {
+      return detail.map((e) => e.msg ?? JSON.stringify(e)).join('; ') || 'Validation error';
+    }
+    if (typeof detail === 'string') return detail;
+    return data?.message || error.message || 'An error occurred';
   }
   if (error instanceof Error) return error.message;
   return 'An unexpected error occurred';

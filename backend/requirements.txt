@@ -2,8 +2,9 @@ fastapi
 uvicorn[standard]
 sqlalchemy
 alembic
-pydantic
+pydantic[email]
 pydantic-settings
+email-validator>=2.0.0
 python-jose[cryptography]
 python-multipart>=0.0.6
 redis
@@ -16,3 +17,4 @@ psycopg2-binary>=2.9.0
 google-auth>=2.0.0
 eth-account>=0.10.0
 web3>=6.0.0
+stripe>=7.0.0

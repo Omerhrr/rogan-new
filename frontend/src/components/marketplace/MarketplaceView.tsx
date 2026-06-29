@@ -1,15 +1,46 @@
 'use client';
 
 import { useState, useEffect } from 'react';
-import { Store, ShoppingCart, Plus, Tag } from 'lucide-react';
+import { Store, ShoppingCart, Plus, Tag, Briefcase } from 'lucide-react';
 import { useMarketplaceStore } from '@/stores/marketplaceStore';
 import { useAuthStore } from '@/stores/authStore';
 import { useIsMobile } from '@/hooks/use-mobile';
 import { cn, formatTK } from '@/lib/utils';
 import EmptyState from '@/components/shared/EmptyState';
 import LoadingSpinner from '@/components/shared/LoadingSpinner';
+import TaskMarketplace from '@/components/marketplace/TaskMarketplace';
 
 export default function MarketplaceView() {
+  const [mainTab, setMainTab] = useState<'products' | 'tasks'>('products');
+
+  // Show tab switcher wrapping both marketplace and task views
+  return (
+    <div className="h-full flex flex-col">
+      {/* Top tab bar */}
+      <div className="flex gap-1 bg-surface border-b border-white/5 px-4 pt-3 pb-0">
+        <button
+          onClick={() => setMainTab('products')}
+          className={cn('flex items-center gap-2 px-4 py-2.5 text-sm font-medium border-b-2 transition-colors -mb-px',
+            mainTab === 'products' ? 'border-rogan-500 text-white' : 'border-transparent text-white/40 hover:text-white')}
+        >
+          <Store className="w-4 h-4" /> Products
+        </button>
+        <button
+          onClick={() => setMainTab('tasks')}
+          className={cn('flex items-center gap-2 px-4 py-2.5 text-sm font-medium border-b-2 transition-colors -mb-px',
+            mainTab === 'tasks' ? 'border-rogan-500 text-white' : 'border-transparent text-white/40 hover:text-white')}
+        >
+          <Briefcase className="w-4 h-4" /> Tasks
+        </button>
+      </div>
+      <div className="flex-1 overflow-hidden">
+        {mainTab === 'tasks' ? <TaskMarketplace /> : <ProductsMarketplace />}
+      </div>
+    </div>
+  );
+}
+
+function ProductsMarketplace() {
   const { products, fetchProducts, createProduct, purchaseProduct, isLoading } = useMarketplaceStore();
   const { user } = useAuthStore();
   const isMobile = useIsMobile(960);

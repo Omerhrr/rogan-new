@@ -257,7 +257,7 @@ def send_battle_gift(
 
 
 def get_battle(db: Session, battle_id: str) -> Dict[str, Any]:
-    """Get battle status + live scores."""
+    """Get battle status + live scores (includes creator usernames and avatars)."""
     battle = db.query(PKBattle).filter(PKBattle.id == battle_id).first()
     if not battle:
         raise HTTPException(
@@ -268,10 +268,20 @@ def get_battle(db: Session, battle_id: str) -> Dict[str, Any]:
     # Get live scores from Redis if available
     scores = _get_battle_scores(battle_id)
 
+    # Fetch creator profiles for display
+    creator_a = db.query(User).filter(User.id == battle.creator_a_id).first()
+    creator_b = db.query(User).filter(User.id == battle.creator_b_id).first()
+    winner = db.query(User).filter(User.id == battle.winner_id).first() if battle.winner_id else None
+
     return {
         "id": battle.id,
         "creator_a_id": battle.creator_a_id,
         "creator_b_id": battle.creator_b_id,
+        "creator_a_username": creator_a.username if creator_a else None,
+        "creator_b_username": creator_b.username if creator_b else None,
+        "creator_a_avatar": creator_a.avatar if creator_a else None,
+        "creator_b_avatar": creator_b.avatar if creator_b else None,
+        "winner_username": winner.username if winner else None,
         "duration_minutes": battle.duration_minutes,
         "entry_gift_requirements": battle.entry_gift_requirements,
         "status": battle.status,
@@ -296,12 +306,23 @@ def list_active_battles(db: Session, page: int = 1, limit: int = 20) -> Dict[str
     offset = (page - 1) * limit
     battles = query.offset(offset).limit(limit).all()
 
+    # Collect all unique creator IDs for a single batch query
+    creator_ids = set()
+    for b in battles:
+        creator_ids.add(b.creator_a_id)
+        creator_ids.add(b.creator_b_id)
+    users = {u.id: u for u in db.query(User).filter(User.id.in_(creator_ids)).all()}
+
     return {
         "battles": [
             {
                 "id": b.id,
                 "creator_a_id": b.creator_a_id,
                 "creator_b_id": b.creator_b_id,
+                "creator_a_username": users.get(b.creator_a_id, {}).username if users.get(b.creator_a_id) else None,
+                "creator_b_username": users.get(b.creator_b_id, {}).username if users.get(b.creator_b_id) else None,
+                "creator_a_avatar": users.get(b.creator_a_id, {}).avatar if users.get(b.creator_a_id) else None,
+                "creator_b_avatar": users.get(b.creator_b_id, {}).avatar if users.get(b.creator_b_id) else None,
                 "duration_minutes": b.duration_minutes,
                 "status": b.status,
                 "creator_a_score": b.creator_a_score or 0,
@@ -424,21 +445,8 @@ def _init_battle_scores(battle_id: str) -> None:
         pass
 
 
-def _update_battle_scores(battle: PKBattle) -> None:
-    """Update battle scores in Redis."""
-    try:
-        key = f"pk_scores:{battle.id}"
-        redis_client.set(
-            key,
-            json.dumps({"a": battle.creator_a_score or 0, "b": battle.creator_b_score or 0}),
-            ex=7200,
-        )
-    except Exception:
-        pass
-
-
 def _get_battle_scores(battle_id: str) -> Dict[str, float]:
-    """Get battle scores from Redis."""
+    """Get live battle scores from Redis. Falls back to empty dict (caller uses DB scores)."""
     try:
         key = f"pk_scores:{battle_id}"
         data = redis_client.get(key)
@@ -449,38 +457,59 @@ def _get_battle_scores(battle_id: str) -> Dict[str, float]:
     return {}
 
 
-def _publish_score_update(battle: PKBattle) -> None:
-    """Publish score update event for WebSocket distribution."""
+def _update_battle_scores(battle: PKBattle) -> None:
+    """Write updated scores to Redis."""
     try:
-        event = {
-            "type": "pk_score_update",
-            "battle_id": battle.id,
-            "creator_a_score": battle.creator_a_score or 0,
-            "creator_b_score": battle.creator_b_score or 0,
-        }
-        redis_client.publish(f"pk_battle:{battle.id}", json.dumps(event))
+        key = f"pk_scores:{battle.id}"
+        redis_client.set(
+            key,
+            json.dumps({"a": battle.creator_a_score or 0.0, "b": battle.creator_b_score or 0.0}),
+            ex=7200,
+        )
     except Exception:
         pass
 
 
 def _cache_battle_state(battle: PKBattle) -> None:
-    """Cache battle state in Redis for quick lookups."""
+    """Cache battle metadata in Redis for fast lookup."""
     try:
         key = f"pk_battle:{battle.id}"
-        state = {
-            "id": battle.id,
-            "status": battle.status,
-            "creator_a_id": battle.creator_a_id,
-            "creator_b_id": battle.creator_b_id,
-        }
-        redis_client.set(key, json.dumps(state), ex=7200)
+        redis_client.set(
+            key,
+            json.dumps({
+                "id": battle.id,
+                "status": battle.status,
+                "creator_a_id": battle.creator_a_id,
+                "creator_b_id": battle.creator_b_id,
+                "duration_minutes": battle.duration_minutes,
+                "started_at": battle.started_at.isoformat() if battle.started_at else None,
+            }),
+            ex=7200,
+        )
+    except Exception:
+        pass
+
+
+def _publish_score_update(battle: PKBattle) -> None:
+    """Publish a score update event to the Redis channel (picked up by WS broadcaster)."""
+    try:
+        channel = f"pk_scores_channel:{battle.id}"
+        redis_client.publish(
+            channel,
+            json.dumps({
+                "type": "pk_score_update",
+                "battle_id": battle.id,
+                "creator_a_score": battle.creator_a_score or 0.0,
+                "creator_b_score": battle.creator_b_score or 0.0,
+            }),
+        )
     except Exception:
         pass
 
 
 def _cleanup_battle_redis(battle_id: str) -> None:
-    """Clean up Redis keys for a finished battle."""
+    """Remove battle keys from Redis after the battle ends."""
     try:
-        redis_client.delete(f"pk_scores:{battle_id}")
+        redis_client.delete(f"pk_scores:{battle_id}", f"pk_battle:{battle_id}")
     except Exception:
         pass

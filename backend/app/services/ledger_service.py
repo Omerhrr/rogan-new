@@ -31,8 +31,13 @@ def create_transaction(
     to_user_id: str,
     reference_id: Optional[str] = None,
     metadata: Optional[Dict[str, Any]] = None,
+    auto_commit: bool = True,
 ) -> Transaction:
-    """Create an immutable ledger entry. No balance mutation — balances are derived."""
+    """Create an immutable ledger entry. No balance mutation — balances are derived.
+
+    auto_commit=False: caller is responsible for committing (enables atomic multi-transaction
+    batches, e.g. gift_send + platform_fee in a single DB transaction).
+    """
     transaction = Transaction(
         type=type,
         amount=amount,
@@ -43,8 +48,11 @@ def create_transaction(
         created_at=datetime.utcnow(),
     )
     db.add(transaction)
-    db.commit()
-    db.refresh(transaction)
+    if auto_commit:
+        db.commit()
+        db.refresh(transaction)
+    else:
+        db.flush()  # Assign ID without committing; caller commits the whole batch
     return transaction
 
 
@@ -64,25 +72,14 @@ def get_tk_balance(db: Session, user_id: str) -> float:
 
 
 def get_tk_balance_with_lock(db: Session, user_id: str) -> float:
-    """Derive TK balance with row-level locking to prevent TOCTOU races.
-    Uses SELECT ... FOR UPDATE on a serializable isolation window.
-    For SQLite this is a no-op; for PostgreSQL it acquires row locks.
+    """Derive TK balance from transaction history.
+
+    NOTE: PostgreSQL does not allow FOR UPDATE with aggregate functions
+    (SELECT SUM(...) FOR UPDATE raises ProgrammingError). True TOCTOU
+    protection at scale requires a dedicated balance column; for MVP
+    the aggregate query is sufficient.
     """
-    # Use a savepoint so the FOR UPDATE doesn't leak outside the check
-    # Query all transactions for this user with row lock to prevent concurrent modification
-    total_received = (
-        db.query(func.coalesce(func.sum(Transaction.amount), 0.0))
-        .filter(Transaction.to_user_id == user_id)
-        .with_for_update()
-        .scalar()
-    )
-    total_sent = (
-        db.query(func.coalesce(func.sum(Transaction.amount), 0.0))
-        .filter(Transaction.from_user_id == user_id)
-        .with_for_update()
-        .scalar()
-    )
-    return round(total_received - total_sent, 2)
+    return get_tk_balance(db, user_id)
 
 
 def process_deposit(db: Session, user_id: str, rogan_amount: float) -> Transaction:
@@ -173,7 +170,8 @@ def process_gift(
     creator_earnings = calculate_creator_earnings(tk_amount)
     platform_fee = calculate_platform_fee(tk_amount)
 
-    # Debit sender: sender -> receiver (full amount)
+    # Debit sender and take platform fee atomically — both rows committed in one transaction
+    # to prevent a partial state where the sender is debited but the fee row is missing.
     sender_tx = create_transaction(
         db=db,
         type="gift_send",
@@ -187,6 +185,7 @@ def process_gift(
             "creator_earnings": creator_earnings,
             "platform_fee": platform_fee,
         },
+        auto_commit=False,  # Don't commit yet — wait for platform fee row
     )
 
     # Platform fee: receiver -> SYSTEM (10%)
@@ -203,7 +202,12 @@ def process_gift(
                 "fee_rate": 0.10,
                 "platform_fee": platform_fee,
             },
+            auto_commit=False,  # Committed below with sender_tx in one shot
         )
+
+    # Single atomic commit — both ledger rows land together or neither does
+    db.commit()
+    db.refresh(sender_tx)
 
     return sender_tx, creator_earnings
 

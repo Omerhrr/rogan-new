@@ -12,7 +12,7 @@ from fastapi import HTTPException, status
 from sqlalchemy import func
 from sqlalchemy.orm import Session
 
-from app.models.models import ModerationReport, User, UserBan, UserStrike
+from app.models.models import Appeal, ModerationReport, Stream, StreamBan, User, UserBan, UserStrike
 from app.services.notification_service import create_notification
 from app.utils.redis_client import redis_client
 
@@ -35,6 +35,11 @@ SPAM_WINDOW_SECONDS = 10
 URL_PATTERN = r'https?://[^\s<>"]+|www\.[^\s<>"]+'
 
 
+def _resolve_username(db: Session, user_id: str) -> Optional[str]:
+    u = db.query(User).filter(User.id == user_id).first()
+    return u.username if u else None
+
+
 def create_report(
     db: Session,
     reporter_id: str,
@@ -54,6 +59,16 @@ def create_report(
     # Calculate priority based on report content and reporter history
     priority = _calculate_report_priority(db, reporter_id, target_type, reason)
 
+    # Resolve usernames for quick display
+    reporter_username = _resolve_username(db, reporter_id)
+    if target_type == "user":
+        target_username = _resolve_username(db, target_id)
+    elif target_type == "stream":
+        stream = db.query(Stream).filter(Stream.id == target_id).first()
+        target_username = _resolve_username(db, stream.creator_id) if stream else None
+    else:
+        target_username = None
+
     report = ModerationReport(
         reporter_id=reporter_id,
         target_type=target_type,
@@ -62,6 +77,8 @@ def create_report(
         evidence_url=evidence_url,
         priority=priority,
         status="pending",
+        reporter_username=reporter_username,
+        target_username=target_username,
     )
     db.add(report)
     db.commit()
@@ -99,8 +116,10 @@ def get_pending_reports(
             {
                 "id": r.id,
                 "reporter_id": r.reporter_id,
+                "reporter_username": getattr(r, "reporter_username", None),
                 "target_type": r.target_type,
                 "target_id": r.target_id,
+                "target_username": getattr(r, "target_username", None),
                 "reason": r.reason,
                 "evidence_url": r.evidence_url,
                 "status": r.status,
@@ -497,30 +516,204 @@ def _check_spam(user_id: str, content: str) -> bool:
         return False
 
 
-def _cache_report(report: ModerationReport) -> None:
-    """Cache a report in Redis for quick admin access."""
+def _cache_report(report) -> None:
     try:
-        key = f"mod_report:{report.id}"
-        data = {
-            "id": report.id,
-            "status": report.status,
-            "priority": report.priority,
-        }
-        redis_client.set(key, json.dumps(data), ex=3600)  # 1 hour
+        key = f"report:{report.id}"
+        redis_client.set(key, json.dumps({"id": report.id, "status": report.status}), ex=3600)
     except Exception:
         pass
 
 
-def _cache_ban(ban: UserBan) -> None:
-    """Cache a ban record in Redis for fast lookup."""
+def _cache_ban(ban) -> None:
     try:
-        ban_info = {
-            "id": ban.id,
-            "user_id": ban.user_id,
-            "reason": ban.reason,
-            "ban_type": ban.ban_type,
-            "expires_at": ban.expires_at.isoformat() if ban.expires_at else None,
-        }
-        redis_client.set(f"user_ban:{ban.user_id}", json.dumps(ban_info), ex=300)
+        key = f"user_ban:{ban.user_id}"
+        payload = {"id": ban.id, "user_id": ban.user_id, "reason": ban.reason,
+                   "ban_type": ban.ban_type, "expires_at": ban.expires_at.isoformat() if ban.expires_at else None}
+        ttl = 300
+        if ban.expires_at:
+            remaining = (ban.expires_at - datetime.utcnow()).total_seconds()
+            ttl = max(int(remaining), 10)
+        redis_client.set(key, json.dumps(payload), ex=ttl)
     except Exception:
         pass
+
+
+# --- Force-Stop ---
+
+def force_stop_stream(db: Session, report_id: str, mod_id: str) -> Dict[str, Any]:
+    report = db.query(ModerationReport).filter(ModerationReport.id == report_id).first()
+    if not report:
+        raise HTTPException(status_code=404, detail="Report not found")
+    if report.target_type != "stream":
+        raise HTTPException(status_code=400, detail="Report is not for a stream")
+    stream = db.query(Stream).filter(Stream.id == report.target_id).first()
+    if not stream:
+        raise HTTPException(status_code=404, detail="Stream not found")
+    stream.is_live = False
+    stream.ended_at = datetime.utcnow()
+    report.status = "resolved"
+    report.resolver_id = mod_id
+    report.resolved_at = datetime.utcnow()
+    db.commit()
+    create_notification(db=db, user_id=stream.creator_id, type="moderation",
+                        title="Stream Stopped", message="Your stream was stopped by a moderator.",
+                        metadata={"report_id": report_id})
+    return {"message": "Stream force-stopped", "stream_id": stream.id}
+
+
+# --- Suspend / Lift ---
+
+def suspend_user(db: Session, user_id: str, reason: str, duration_minutes: Optional[int] = None) -> UserBan:
+    user = db.query(User).filter(User.id == user_id).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    return _ban_user(db, user_id, reason, ban_type="live_suspend", duration_minutes=duration_minutes)
+
+
+def lift_ban(db: Session, user_id: str) -> Dict[str, Any]:
+    now = datetime.utcnow()
+    active_bans = (
+        db.query(UserBan)
+        .filter(UserBan.user_id == user_id, UserBan.is_active == True)
+        .filter((UserBan.expires_at == None) | (UserBan.expires_at > now))
+        .all()
+    )
+    count = len(active_bans)
+    for ban in active_bans:
+        ban.is_active = False
+    db.commit()
+    try:
+        redis_client.delete(f"user_ban:{user_id}")
+    except Exception:
+        pass
+    create_notification(db=db, user_id=user_id, type="moderation", title="Restriction Lifted",
+                        message="Your account restrictions have been lifted.", metadata={})
+    return {"message": f"Lifted {count} active ban(s)", "user_id": user_id}
+
+
+# --- Appeals ---
+
+def submit_appeal(db: Session, user_id: str, reason: str, ban_id: Optional[str] = None) -> Appeal:
+    appeal = Appeal(user_id=user_id, ban_id=ban_id, reason=reason, status="pending", created_at=datetime.utcnow())
+    db.add(appeal)
+    db.commit()
+    db.refresh(appeal)
+    return appeal
+
+
+def get_appeals(db: Session, status_filter: Optional[str] = None, page: int = 1, limit: int = 20) -> Dict[str, Any]:
+    query = db.query(Appeal)
+    if status_filter and status_filter != "all":
+        query = query.filter(Appeal.status == status_filter)
+    query = query.order_by(Appeal.created_at.desc())
+    total = query.count()
+    appeals = query.offset((page - 1) * limit).limit(limit).all()
+
+    def _uname(uid):
+        if not uid: return None
+        u = db.query(User).filter(User.id == uid).first()
+        return u.username if u else None
+
+    return {
+        "appeals": [{"id": a.id, "user_id": a.user_id, "username": _uname(a.user_id),
+                     "ban_id": a.ban_id, "reason": a.reason, "status": a.status,
+                     "reviewer_id": a.reviewer_id, "reviewer_note": a.reviewer_note,
+                     "created_at": a.created_at.isoformat() if a.created_at else None,
+                     "reviewed_at": a.reviewed_at.isoformat() if a.reviewed_at else None}
+                    for a in appeals],
+        "total": total, "page": page, "limit": limit,
+        "pages": (total + limit - 1) // limit if total > 0 else 0,
+    }
+
+
+def review_appeal(db: Session, appeal_id: str, reviewer_id: str, approved: bool,
+                  reviewer_note: Optional[str] = None) -> Dict[str, Any]:
+    appeal = db.query(Appeal).filter(Appeal.id == appeal_id).first()
+    if not appeal:
+        raise HTTPException(status_code=404, detail="Appeal not found")
+    appeal.status = "approved" if approved else "rejected"
+    appeal.reviewer_id = reviewer_id
+    appeal.reviewer_note = reviewer_note
+    appeal.reviewed_at = datetime.utcnow()
+    db.commit()
+    if approved:
+        if appeal.ban_id:
+            ban = db.query(UserBan).filter(UserBan.id == appeal.ban_id).first()
+            if ban:
+                ban.is_active = False
+                db.commit()
+        else:
+            lift_ban(db, appeal.user_id)
+        create_notification(db=db, user_id=appeal.user_id, type="moderation",
+                            title="Appeal Approved", message="Your appeal was approved and restriction lifted.",
+                            metadata={"appeal_id": appeal_id})
+    else:
+        create_notification(db=db, user_id=appeal.user_id, type="moderation",
+                            title="Appeal Rejected",
+                            message=f"Your appeal was rejected.{' Reason: ' + reviewer_note if reviewer_note else ''}",
+                            metadata={"appeal_id": appeal_id})
+    return {"appeal_id": appeal_id, "status": appeal.status,
+            "message": "Appeal approved and ban lifted" if approved else "Appeal rejected"}
+
+
+# --- Stream Bans ---
+
+def ban_viewer_from_stream(db: Session, creator_id: str, viewer_id: str,
+                           reason: Optional[str] = None) -> StreamBan:
+    existing = db.query(StreamBan).filter(StreamBan.creator_id == creator_id,
+                                          StreamBan.banned_user_id == viewer_id).first()
+    if existing:
+        return existing
+    ban = StreamBan(creator_id=creator_id, banned_user_id=viewer_id, reason=reason,
+                    created_at=datetime.utcnow())
+    db.add(ban)
+    db.commit()
+    db.refresh(ban)
+    # Bust cache
+    try:
+        redis_client.delete(f"stream_ban:{creator_id}:{viewer_id}")
+    except Exception:
+        pass
+    return ban
+
+
+def unban_viewer_from_stream(db: Session, creator_id: str, viewer_id: str) -> Dict[str, Any]:
+    ban = db.query(StreamBan).filter(StreamBan.creator_id == creator_id,
+                                     StreamBan.banned_user_id == viewer_id).first()
+    if not ban:
+        raise HTTPException(status_code=404, detail="Stream ban not found")
+    db.delete(ban)
+    db.commit()
+    try:
+        redis_client.delete(f"stream_ban:{creator_id}:{viewer_id}")
+    except Exception:
+        pass
+    return {"message": "Stream ban lifted", "viewer_id": viewer_id}
+
+
+def get_stream_banned_viewers(db: Session, creator_id: str) -> List[Dict[str, Any]]:
+    bans = db.query(StreamBan).filter(StreamBan.creator_id == creator_id).all()
+    def _uname(uid):
+        u = db.query(User).filter(User.id == uid).first()
+        return u.username if u else None
+    return [{"id": b.id, "banned_user_id": b.banned_user_id, "username": _uname(b.banned_user_id),
+             "reason": b.reason, "created_at": b.created_at.isoformat() if b.created_at else None}
+            for b in bans]
+
+
+def check_stream_banned(db: Session, creator_id: str, viewer_id: str) -> bool:
+    try:
+        key = f"stream_ban:{creator_id}:{viewer_id}"
+        cached = redis_client.get(key)
+        if cached is not None:
+            return cached == b"1"
+    except Exception:
+        pass
+    ban = db.query(StreamBan).filter(StreamBan.creator_id == creator_id,
+                                     StreamBan.banned_user_id == viewer_id).first()
+    result = ban is not None
+    try:
+        redis_client.set(f"stream_ban:{creator_id}:{viewer_id}", b"1" if result else b"0", ex=300)
+    except Exception:
+        pass
+    return result

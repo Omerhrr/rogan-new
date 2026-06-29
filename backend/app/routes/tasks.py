@@ -23,7 +23,7 @@ from app.services import task_service
 router = APIRouter(prefix="/tasks", tags=["Task Marketplace"])
 
 
-@router.post("/", status_code=status.HTTP_201_CREATED)
+@router.post("", status_code=status.HTTP_201_CREATED)
 def create_task(
     req: TaskCreate,
     current_user: User = Depends(get_current_user_dependency),
@@ -46,7 +46,7 @@ def create_task(
     return _task_response(task, db)
 
 
-@router.get("/")
+@router.get("")
 def browse_tasks(
     category: Optional[str] = Query(None),
     min_price: Optional[float] = Query(None, ge=0),

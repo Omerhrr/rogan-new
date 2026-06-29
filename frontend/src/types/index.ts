@@ -11,8 +11,9 @@ export interface User {
   username: string;
   display_name: string | null;
   avatar: string | null;
+  banner_url?: string | null;
   bio: string | null;
-  role: 'user' | 'creator' | 'admin';
+  role: 'user' | 'creator' | 'moderator' | 'admin';
   is_live: boolean;
   created_at: string | null;
 }
@@ -58,7 +59,11 @@ export interface Stream {
   created_at: string | null;
   ended_at: string | null;
   creator: User | null;
-  stream_key: string | null;
+  stream_key: string | null;   // RTMP publish key — only returned to the creator
+  hls_url: string | null;      // Public HLS playback URL — returned for all viewers
+  active_private_show_id?: string | null;
+  private_show_price?: number | null;
+  private_show_status?: 'announced' | 'live' | null;
 }
 
 export interface StreamListResponse {
@@ -114,6 +119,17 @@ export const GIFT_CONFIG: Record<GiftType, { price: number; emoji: string; label
 
 // ─── Wallet ──────────────────────────────────────────────────
 
+export interface WalletInfo {
+  tk_balance: number;
+  wallet_address: string | null;
+  rogan_price_usd: number;
+  platform_wallet: string | null;
+  rogan_contract: string | null;
+  tk_per_usd: number;
+  min_deposit_usd: number;
+}
+
+// Keep legacy Wallet alias so other components don't break
 export interface Wallet {
   id: string | null;
   user_id: string;
@@ -130,6 +146,56 @@ export interface Transaction {
   to_user_id: string;
   reference_id: string | null;
   metadata: string | null;
+  created_at: string | null;
+}
+
+export interface CryptoDepositResult {
+  tx_hash: string;
+  amount_rogan: number;
+  amount_usd: number;
+  amount_tk: number;
+  rogan_price_usd: number;
+  status: string;
+}
+
+export interface StripeIntentResult {
+  client_secret: string;
+  payment_intent_id: string;
+  amount_usd: number;
+  amount_tk: number;
+}
+
+export interface WithdrawalRequest {
+  id: string;
+  amount_tk: number;
+  amount_rogan: number | null;
+  rogan_price_usd: number | null;
+  wallet_address: string;
+  status: string;
+  tx_hash: string | null;
+  rejection_reason: string | null;
+  requested_at: string | null;
+  processed_at: string | null;
+}
+
+export interface SendHistoryItem {
+  id: string;
+  direction: 'sent' | 'received';
+  amount_tk: number;
+  other_user_id: string;
+  other_username: string;
+  other_avatar: string | null;
+  created_at: string | null;
+}
+
+export interface DepositHistoryItem {
+  id: string;
+  type: 'rogan' | 'stripe';
+  amount_tk: number;
+  amount_usd: number;
+  amount_rogan?: number;
+  tx_hash?: string;
+  status: string;
   created_at: string | null;
 }
 
@@ -167,6 +233,13 @@ export interface DMMessage {
   amount_tk: number | null;
   read_at: string | null;
   created_at: string | null;
+  reply_to_id?: string | null;
+  reply_to?: { id: string; sender_id: string; content: string } | null;
+  edited_at?: string | null;
+  is_deleted?: boolean;
+  message_type?: 'text' | 'voice' | 'sticker' | 'photo';
+  audio_url?: string | null;
+  audio_duration?: number | null;
 }
 
 export interface DMPriceUpdate {
@@ -262,9 +335,12 @@ export interface SubscriptionTier {
 export interface Subscription {
   id: string;
   subscriber_id: string;
+  subscriber_username: string | null;
   creator_id: string;
+  creator_username: string | null;
+  creator_display_name: string | null;
   tier_id: string | null;
-  tier: 'basic' | 'premium' | 'vip';
+  tier: string;
   price: number;
   is_active: boolean;
   status: string;
@@ -385,13 +461,15 @@ export type ViewType =
   | 'subscriptions'
   | 'moderation'
   | 'web3'
-  | 'settings';
+  | 'settings'
+  | 'private-shows';
 
 export interface ChatMessage {
   id: string;
   stream_id: string;
   user_id: string;
   username: string;
+  role?: string;
   avatar: string | null;
   message: string;
   type: 'chat' | 'system' | 'gift_alert';

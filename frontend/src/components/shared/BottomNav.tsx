@@ -1,8 +1,9 @@
 'use client';
 
-import { Radio, Swords, Store, MessageSquare, Wallet, User } from 'lucide-react';
+import { Radio, MessageSquare, Wallet, Lock, Settings, Video } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import { useNotificationStore } from '@/stores/notificationStore';
+import { useAuthStore } from '@/stores/authStore';
 import type { ViewType } from '@/types';
 
 interface BottomNavProps {
@@ -10,17 +11,20 @@ interface BottomNavProps {
   onViewChange: (view: ViewType) => void;
 }
 
-const TABS: { view: ViewType; label: string; icon: React.ComponentType<{ className?: string }> }[] = [
-  { view: 'feed', label: 'Live', icon: Radio },
-  { view: 'pk', label: 'PK', icon: Swords },
-  { view: 'marketplace', label: 'Services', icon: Store },
-  { view: 'messages', label: 'DMs', icon: MessageSquare },
-  { view: 'wallet', label: 'Wallet', icon: Wallet },
-  { view: 'profile', label: 'Me', icon: User },
+const ALL_TABS: { view: ViewType; label: string; icon: React.ComponentType<{ className?: string }>; creatorOnly?: boolean }[] = [
+  { view: 'feed',          label: 'Live',    icon: Radio },
+  { view: 'private-shows', label: 'Private', icon: Lock },
+  { view: 'golive',        label: 'Stream',  icon: Video, creatorOnly: true },
+  { view: 'messages',      label: 'DMs',     icon: MessageSquare },
+  { view: 'wallet',        label: 'Wallet',  icon: Wallet },
+  { view: 'settings',      label: 'Me',      icon: Settings },
 ];
 
 export default function BottomNav({ activeView, onViewChange }: BottomNavProps) {
   const { unreadCount } = useNotificationStore();
+  const { user } = useAuthStore();
+  const isCreator = user?.role === 'creator' || user?.role === 'admin';
+  const TABS = ALL_TABS.filter((t) => !t.creatorOnly || isCreator);
 
   return (
     <nav className="fixed bottom-0 left-0 right-0 bg-surface border-t border-white/10 safe-bottom z-50">

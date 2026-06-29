@@ -26,6 +26,7 @@ class User(Base):
     google_id = Column(String, unique=True, nullable=True)
     display_name = Column(String, nullable=True)
     avatar = Column(String, nullable=True)
+    banner_url = Column(String, nullable=True)
     bio = Column(Text, nullable=True)
     role = Column(String, default="user")  # user | creator | admin
     is_live = Column(Boolean, default=False)
@@ -87,6 +88,8 @@ class Stream(Base):
     category = Column(String, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
     ended_at = Column(DateTime, nullable=True)
+
+    active_private_show_id = Column(String, nullable=True)  # FK set manually to avoid circular FK
 
     creator = relationship("User", back_populates="streams", foreign_keys=[creator_id])
     gifts = relationship("Gift", back_populates="stream")
@@ -246,7 +249,10 @@ class PrivateShow(Base):
     price_tk = Column(Float, nullable=False)  # Entry fee per viewer
     duration_minutes = Column(Integer, nullable=False)  # Scheduled duration
     max_viewers = Column(Integer, nullable=True)  # Capacity cap (None = unlimited)
-    status = Column(String, default="waiting", index=True)  # waiting | live | ended
+    live_stream_id = Column(String, nullable=True)  # which live stream this is attached to
+    countdown_seconds = Column(Integer, nullable=True)
+    announced_at = Column(DateTime, nullable=True)
+    status = Column(String, default="waiting", index=True)  # waiting | announced | live | ended
     started_at = Column(DateTime, nullable=True)
     ended_at = Column(DateTime, nullable=True)
     total_revenue = Column(Float, default=0.0)
@@ -299,9 +305,16 @@ class DMMessage(Base):
     amount_tk = Column(Float, nullable=True)
     read_at = Column(DateTime, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow, index=True)
+    reply_to_id = Column(String, ForeignKey("dm_messages.id", ondelete="SET NULL"), nullable=True)
+    edited_at = Column(DateTime, nullable=True)
+    is_deleted = Column(Boolean, default=False, nullable=False)
+    message_type = Column(String, default='text', nullable=False)  # 'text' | 'voice'
+    audio_url = Column(String, nullable=True)
+    audio_duration = Column(Float, nullable=True)  # seconds
 
     conversation = relationship("DMConversation", back_populates="messages")
     sender = relationship("User", backref="dm_messages_sent")
+    reply_to = relationship("DMMessage", remote_side="DMMessage.id", foreign_keys="[DMMessage.reply_to_id]")
 
 
 # ─── Phase 2: Task Marketplace Models ──────────────────────────────
@@ -452,6 +465,9 @@ class ModerationReport(Base):
     created_at = Column(DateTime, default=datetime.utcnow)
     resolved_at = Column(DateTime, nullable=True)
     resolver_id = Column(String, ForeignKey("users.id"), nullable=True)
+    # Denormalised for quick display without joins
+    reporter_username = Column(String, nullable=True)
+    target_username = Column(String, nullable=True)  # username of reported user / creator of reported stream
 
     reporter = relationship("User", foreign_keys=[reporter_id], backref="moderation_reports_filed")
     resolver = relationship("User", foreign_keys=[resolver_id], backref="moderation_reports_resolved")
@@ -464,7 +480,8 @@ class UserBan(Base):
     id = Column(String, primary_key=True, default=generate_uuid)
     user_id = Column(String, ForeignKey("users.id"), nullable=False, index=True)
     reason = Column(Text, nullable=False)
-    ban_type = Column(String, default="full_ban")  # chat_mute | full_ban
+    ban_type = Column(String, default="full_ban")  # chat_mute | full_ban | live_suspend
+    is_active = Column(Boolean, default=True)
     expires_at = Column(DateTime, nullable=True)  # None = permanent
     created_at = Column(DateTime, default=datetime.utcnow)
 
@@ -481,3 +498,107 @@ class UserStrike(Base):
     created_at = Column(DateTime, default=datetime.utcnow)
 
     user = relationship("User", backref="strikes")
+
+
+class Appeal(Base):
+    """Creator appeals a ban or live-suspension imposed by moderation."""
+    __tablename__ = "appeals"
+
+    id = Column(String, primary_key=True, default=generate_uuid)
+    user_id = Column(String, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    ban_id = Column(String, ForeignKey("user_bans.id", ondelete="SET NULL"), nullable=True)
+    reason = Column(Text, nullable=False)
+    status = Column(String, default="pending")  # pending | approved | rejected
+    reviewer_id = Column(String, ForeignKey("users.id"), nullable=True)
+    reviewer_note = Column(Text, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    reviewed_at = Column(DateTime, nullable=True)
+
+    user = relationship("User", foreign_keys=[user_id], backref="appeals")
+    reviewer = relationship("User", foreign_keys=[reviewer_id])
+
+
+class StreamBan(Base):
+    """Creator bans a specific viewer from their stream chat."""
+    __tablename__ = "stream_bans"
+
+    id = Column(String, primary_key=True, default=generate_uuid)
+    creator_id = Column(String, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    banned_user_id = Column(String, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    reason = Column(String, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    creator = relationship("User", foreign_keys=[creator_id], backref="stream_bans_issued")
+    banned_user = relationship("User", foreign_keys=[banned_user_id], backref="stream_bans_received")
+
+
+class Follow(Base):
+    """Creator follow relationship."""
+    __tablename__ = "follows"
+
+    id = Column(String, primary_key=True, default=generate_uuid)
+    follower_id = Column(String, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    following_id = Column(String, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    follower = relationship("User", foreign_keys=[follower_id], backref="following")
+    following = relationship("User", foreign_keys=[following_id], backref="followers")
+
+    __table_args__ = (
+        # Unique constraint: one user can follow another only once
+        __import__('sqlalchemy').UniqueConstraint("follower_id", "following_id", name="uq_follow_pair"),
+    )
+
+
+
+class CryptoDeposit(Base):
+    """ROGAN on-chain deposit — verified via tx hash on Base."""
+    __tablename__ = "crypto_deposits"
+
+    id = Column(String, primary_key=True, default=generate_uuid)
+    user_id = Column(String, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    tx_hash = Column(String, nullable=False, unique=True, index=True)
+    wallet_address = Column(String, nullable=False)   # tx.from must match user's linked wallet
+    amount_rogan = Column(Float, nullable=False)      # human-readable ROGAN received
+    amount_usd = Column(Float, nullable=False)        # USD value at deposit time
+    amount_tk = Column(Float, nullable=False)         # TK credited to user
+    rogan_price_usd = Column(Float, nullable=False)   # DexScreener price snapshot
+    status = Column(String, default="confirmed")
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    user = relationship("User", backref="crypto_deposits")
+
+
+class StripePayment(Base):
+    """Stripe one-time purchase — fiat → TK."""
+    __tablename__ = "stripe_payments"
+
+    id = Column(String, primary_key=True, default=generate_uuid)
+    user_id = Column(String, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    stripe_payment_intent_id = Column(String, nullable=False, unique=True, index=True)
+    amount_usd = Column(Float, nullable=False)
+    amount_tk = Column(Float, nullable=False)
+    currency = Column(String, default="usd")
+    status = Column(String, default="pending")  # pending | succeeded | failed
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    user = relationship("User", backref="stripe_payments")
+
+
+class WithdrawalRequest(Base):
+    """User request to withdraw TK as ROGAN. Admin processes manually."""
+    __tablename__ = "withdrawal_requests"
+
+    id = Column(String, primary_key=True, default=generate_uuid)
+    user_id = Column(String, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    wallet_address = Column(String, nullable=False)   # destination Base address
+    amount_tk = Column(Float, nullable=False)
+    amount_rogan = Column(Float, nullable=True)       # calculated at processing time
+    rogan_price_usd = Column(Float, nullable=True)    # price at processing time
+    status = Column(String, default="pending")        # pending | approved | rejected | completed
+    rejection_reason = Column(String, nullable=True)
+    tx_hash = Column(String, nullable=True)           # outgoing tx hash when completed
+    requested_at = Column(DateTime, default=datetime.utcnow)
+    processed_at = Column(DateTime, nullable=True)
+
+    user = relationship("User", backref="withdrawal_requests")

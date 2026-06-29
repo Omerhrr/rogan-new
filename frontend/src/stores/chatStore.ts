@@ -26,9 +26,12 @@ export const useChatStore = create<ChatState>()((set) => ({
   isOpen: true,
 
   addMessage: (msg: ChatMessage) =>
-    set((state) => ({
-      messages: [...state.messages.slice(-200), msg], // Keep last 200 messages
-    })),
+    set((state) => {
+      // Deduplicate by id — prevents double-adds from React StrictMode double-invocation
+      // of the history fetch effect and from WS echo of optimistic local messages.
+      if (state.messages.some((m) => m.id === msg.id)) return state;
+      return { messages: [...state.messages.slice(-200), msg] };
+    }),
 
   addSystemMessage: (message: string) =>
     set((state) => ({

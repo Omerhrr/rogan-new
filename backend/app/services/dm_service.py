@@ -102,6 +102,10 @@ def send_message(
     conversation_id: str,
     sender_id: str,
     content: str,
+    reply_to_id: Optional[str] = None,
+    message_type: str = 'text',
+    audio_url: Optional[str] = None,
+    audio_duration: Optional[float] = None,
 ) -> DMMessage:
     """Send a message in a conversation. Handles paid DM logic.
 
@@ -122,10 +126,15 @@ def send_message(
         HTTPException 403: Sender is not a participant.
         HTTPException 400: Empty message or insufficient balance.
     """
-    if not content or not content.strip():
+    if message_type == 'text' and (not content or not content.strip()):
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Message content cannot be empty",
+        )
+    if message_type == 'voice' and not audio_url:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Voice message requires audio_url",
         )
 
     conversation = db.query(DMConversation).filter(
@@ -214,13 +223,26 @@ def send_message(
                     },
                 )
 
+    # Validate reply_to_id if provided
+    if reply_to_id:
+        reply_msg = db.query(DMMessage).filter(
+            DMMessage.id == reply_to_id,
+            DMMessage.conversation_id == conversation_id,
+        ).first()
+        if not reply_msg:
+            reply_to_id = None  # silently ignore invalid reply reference
+
     # Create message
     message = DMMessage(
         conversation_id=conversation_id,
         sender_id=sender_id,
-        content=content.strip(),
+        content=content.strip() if message_type == 'text' else '',
         is_paid=is_paid,
         amount_tk=amount_tk,
+        reply_to_id=reply_to_id,
+        message_type=message_type,
+        audio_url=audio_url,
+        audio_duration=audio_duration,
     )
     db.add(message)
     db.commit()
@@ -320,7 +342,7 @@ def get_conversations(
                 "content": last_message.content,
                 "is_paid": last_message.is_paid,
                 "amount_tk": last_message.amount_tk,
-                "created_at": last_message.created_at.isoformat() if last_message.created_at else None,
+                "created_at": (last_message.created_at.isoformat() + "Z") if last_message.created_at else None,
             } if last_message else None,
             "unread_count": unread_count,
         })
@@ -398,7 +420,18 @@ def get_conversation_messages(
                 "is_paid": m.is_paid,
                 "amount_tk": m.amount_tk,
                 "read_at": m.read_at.isoformat() if m.read_at else None,
-                "created_at": m.created_at.isoformat() if m.created_at else None,
+                "created_at": (m.created_at.isoformat() + "Z") if m.created_at else None,
+                "reply_to_id": m.reply_to_id,
+                "reply_to": {
+                    "id": m.reply_to.id,
+                    "sender_id": m.reply_to.sender_id,
+                    "content": m.reply_to.content,
+                } if m.reply_to_id and m.reply_to else None,
+                "edited_at": (m.edited_at.isoformat() + "Z") if getattr(m, 'edited_at', None) else None,
+                "is_deleted": getattr(m, 'is_deleted', False),
+                "message_type": getattr(m, 'message_type', 'text'),
+                "audio_url": getattr(m, 'audio_url', None),
+                "audio_duration": getattr(m, 'audio_duration', None),
             }
             for m in messages
         ],
@@ -601,3 +634,86 @@ def _publish_dm_event(event_type: str, data: Dict[str, Any]) -> None:
                 redis_client.publish(f"dm_user:{data[key]}", json.dumps(event))
     except Exception as e:
         logger.warning(f"Failed to publish DM event via Redis: {e}")
+
+
+def edit_message(
+    db: Session,
+    message_id: str,
+    user_id: str,
+    content: str,
+) -> DMMessage:
+    """Edit the content of a message. Only the sender can edit."""
+    msg = db.query(DMMessage).filter(DMMessage.id == message_id).first()
+    if not msg:
+        raise HTTPException(status_code=404, detail="Message not found")
+    if msg.sender_id != user_id:
+        raise HTTPException(status_code=403, detail="Cannot edit someone else's message")
+    if getattr(msg, 'is_deleted', False):
+        raise HTTPException(status_code=400, detail="Cannot edit a deleted message")
+    msg.content = content.strip()
+    msg.edited_at = datetime.utcnow()
+    db.commit()
+    db.refresh(msg)
+    return msg
+
+
+def delete_message(
+    db: Session,
+    message_id: str,
+    user_id: str,
+) -> None:
+    """Soft-delete a message. Only the sender can delete. Content replaced with tombstone."""
+    msg = db.query(DMMessage).filter(DMMessage.id == message_id).first()
+    if not msg:
+        raise HTTPException(status_code=404, detail="Message not found")
+    if msg.sender_id != user_id:
+        raise HTTPException(status_code=403, detail="Cannot delete someone else's message")
+    msg.is_deleted = True
+    msg.content = "This message was deleted"
+    db.commit()
+
+
+def clear_conversation_messages(
+    db: Session,
+    conversation_id: str,
+    user_id: str,
+) -> int:
+    """Delete all messages in a conversation. Both participants can do this.
+
+    Returns the number of messages deleted.
+    """
+    conversation = db.query(DMConversation).filter(
+        DMConversation.id == conversation_id
+    ).first()
+    if not conversation:
+        raise HTTPException(status_code=404, detail="Conversation not found")
+
+    if user_id not in (conversation.participant_a_id, conversation.participant_b_id):
+        raise HTTPException(status_code=403, detail="Not a participant")
+
+    count = (
+        db.query(DMMessage)
+        .filter(DMMessage.conversation_id == conversation_id)
+        .delete(synchronize_session=False)
+    )
+    db.commit()
+    return count
+
+
+def delete_conversation(
+    db: Session,
+    conversation_id: str,
+    user_id: str,
+) -> None:
+    """Delete a conversation and all its messages entirely."""
+    conversation = db.query(DMConversation).filter(
+        DMConversation.id == conversation_id
+    ).first()
+    if not conversation:
+        raise HTTPException(status_code=404, detail="Conversation not found")
+
+    if user_id not in (conversation.participant_a_id, conversation.participant_b_id):
+        raise HTTPException(status_code=403, detail="Not a participant")
+
+    db.delete(conversation)
+    db.commit()

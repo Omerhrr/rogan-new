@@ -6,13 +6,19 @@ Uses redis_client for pub/sub across workers.
 
 import html
 import json
+import logging
+import uuid
 from datetime import datetime
+
+logger = logging.getLogger(__name__)
 from typing import Any, Dict, List, Optional, Set
 
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect, status, Query
 
 from app.config import settings
 from app.utils.redis_client import redis_client
+from app.database import SessionLocal
+from app.services.moderation_service import check_stream_banned, check_user_banned
 
 router = APIRouter()
 
@@ -26,9 +32,9 @@ class ConnectionManager:
         # stream_id -> set of user_ids
         self.stream_viewers: Dict[str, Set[str]] = {}
 
-    def connect(self, websocket: WebSocket, stream_id: str, user_id: str):
+    async def connect(self, websocket: WebSocket, stream_id: str, user_id: str):
         """Accept and register a WebSocket connection."""
-        websocket.accept()
+        await websocket.accept()
 
         if stream_id not in self.active_connections:
             self.active_connections[stream_id] = {}
@@ -37,16 +43,36 @@ class ConnectionManager:
         self.active_connections[stream_id][user_id] = websocket
         self.stream_viewers[stream_id].add(user_id)
 
-    def disconnect(self, stream_id: str, user_id: str):
-        """Remove a WebSocket connection."""
-        if stream_id in self.active_connections:
-            self.active_connections[stream_id].pop(user_id, None)
-            self.stream_viewers[stream_id].discard(user_id)
+    def disconnect(self, stream_id: str, user_id: str, websocket: Optional[WebSocket] = None):
+        """Remove a WebSocket connection.
 
-            # Cleanup empty streams
-            if not self.active_connections[stream_id]:
-                del self.active_connections[stream_id]
-                del self.stream_viewers[stream_id]
+        Pass `websocket` to guard against the React StrictMode race:
+        StrictMode double-invokes effects, causing two WS connections for the
+        same user_id in quick succession.  The sequence is:
+          1. WS1 connects  → manager stores WS1 for user_id
+          2. WS2 connects  → manager replaces WS1 with WS2 for user_id
+          3. WS1 closes    → disconnect() is called — but the stored entry is
+                             now WS2, not WS1.  Without the guard we'd delete
+                             WS2's entry and leave it orphaned (broadcasts stop).
+        The guard skips the removal if the stored websocket no longer matches
+        the one being disconnected.
+        """
+        if stream_id not in self.active_connections:
+            return
+
+        stored = self.active_connections[stream_id].get(user_id)
+
+        # If a specific websocket is supplied, only remove if it's still current.
+        if websocket is not None and stored is not websocket:
+            return  # a newer connection has already replaced this one — leave it
+
+        self.active_connections[stream_id].pop(user_id, None)
+        self.stream_viewers[stream_id].discard(user_id)
+
+        # Cleanup empty streams
+        if not self.active_connections[stream_id]:
+            del self.active_connections[stream_id]
+            del self.stream_viewers[stream_id]
 
     async def send_personal(self, message: dict, websocket: WebSocket):
         """Send a message to a specific WebSocket connection."""
@@ -130,16 +156,54 @@ async def handle_chat_message(
     raw_content = data.get("content", "")
     sanitized_content = _sanitize_text(raw_content)
 
+    # Enforce bans: global ban check + stream-ban check
+    try:
+        db = SessionLocal()
+        try:
+            # Global ban — silently drop the message
+            if check_user_banned(db, user_id):
+                return
+            # Stream-ban — look up creator of this stream and check
+            from app.models.models import Stream
+            stream = db.query(Stream).filter(Stream.id == stream_id).first()
+            if stream and stream.creator_id != user_id:
+                if check_stream_banned(db, stream.creator_id, user_id):
+                    await manager.send_personal(
+                        {"type": "error", "message": "You are banned from this stream's chat."},
+                        manager.active_connections.get(stream_id, {}).get(user_id),
+                    )
+                    return
+        finally:
+            db.close()
+    except Exception as e:
+        logger.warning(f"Ban check failed for user {user_id}: {e}")
+
+    role = data.get("role", "user")
+    # Moderators display as "System" in chat with MOD badge
+    display_username = "System" if role == "moderator" else _sanitize_text(data.get("username", "Anonymous"))
     message = {
+        "id": str(uuid.uuid4()),
         "type": "chat_message",
         "stream_id": stream_id,
         "user_id": user_id,
-        "username": _sanitize_text(data.get("username", "Anonymous")),
+        "username": display_username,
+        "role": role,
         "content": sanitized_content,
         "timestamp": datetime.utcnow().isoformat(),
     }
     _publish_event(stream_id, "chat_message", message)
     await manager.broadcast_to_stream(stream_id, message)
+
+    # Persist to Redis so rejoining viewers get history.
+    # Key: chat_history:{stream_id}  — list of JSON strings, newest at tail.
+    # Keep last 200 messages; expire after 24 h (covers any realistic show length).
+    try:
+        hist_key = f"chat_history:{stream_id}"
+        redis_client.rpush(hist_key, json.dumps(message))
+        redis_client.ltrim(hist_key, -200, -1)
+        redis_client.expire(hist_key, 86400)
+    except Exception as e:
+        logger.warning(f"Failed to persist chat message to Redis: {e}")
 
 
 async def handle_gift_sent(
@@ -254,12 +318,28 @@ async def websocket_endpoint(websocket: WebSocket, stream_id: str, user_id: str,
         await websocket.close(code=status.WS_1008_POLICY_VIOLATION, reason="Token user_id mismatch")
         return
 
-    manager.connect(websocket, stream_id, user_id)
+    # Check for global ban before allowing connection
+    try:
+        _db = SessionLocal()
+        try:
+            ban_info = check_user_banned(_db, user_id)
+            if ban_info and ban_info.get("ban_type") == "full_ban":
+                await websocket.close(code=status.WS_1008_POLICY_VIOLATION, reason="Account banned")
+                return
+        finally:
+            _db.close()
+    except Exception as e:
+        logger.warning(f"Pre-connect ban check failed: {e}")
+
+    await manager.connect(websocket, stream_id, user_id)
+
+    # Use the username from the verified JWT payload (not raw user_id)
+    display_name = payload.get("username") or user_id
 
     try:
         # Notify others of join
         await handle_viewer_join(
-            stream_id, user_id, {"username": user_id}
+            stream_id, user_id, {"username": display_name}
         )
 
         # Send current viewer count to the new connection
@@ -298,10 +378,8 @@ async def websocket_endpoint(websocket: WebSocket, stream_id: str, user_id: str,
                 )
 
     except WebSocketDisconnect:
-        manager.disconnect(stream_id, user_id)
-        # Notify others of leave
-        await handle_viewer_leave(
-            stream_id, user_id, {"username": user_id}
-        )
-    except Exception:
-        manager.disconnect(stream_id, user_id)
+        manager.disconnect(stream_id, user_id, websocket)
+        await handle_viewer_leave(stream_id, user_id, {"username": display_name})
+    except Exception as e:
+        logger.error(f"WebSocket error for user {user_id} in stream {stream_id}: {e}")
+        manager.disconnect(stream_id, user_id, websocket)

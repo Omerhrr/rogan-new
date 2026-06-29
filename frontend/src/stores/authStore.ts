@@ -18,6 +18,7 @@ interface AuthState {
   login: (data: LoginRequest) => Promise<void>;
   register: (data: RegisterRequest) => Promise<void>;
   googleLogin: (googleToken: string) => Promise<void>;
+  setAuth: (user: User, token: string) => void;
   logout: () => void;
   checkAuth: () => Promise<void>;
   updateProfile: (data: UpdateProfileRequest) => Promise<void>;
@@ -71,6 +72,11 @@ export const useAuthStore = create<AuthState>()(
           set({ error: getErrorMessage(err), isLoading: false });
           throw err;
         }
+      },
+
+      setAuth: (user: User, token: string) => {
+        localStorage.setItem('rogan_token', token);
+        set({ user, token, isAuthenticated: true, isLoading: false, error: null });
       },
 
       logout: () => {

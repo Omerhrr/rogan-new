@@ -17,7 +17,7 @@ interface PKState {
   sendBattleGift: (battleId: string, data: { amount_tk: number; side: 'a' | 'b' }) => Promise<void>;
   endBattle: (battleId: string) => Promise<void>;
   fetchActiveBattles: () => Promise<void>;
-  fetchBattle: (id: string) => Promise<void>;
+  fetchBattle: (id: string) => Promise<PKBattle | undefined>;
   clearError: () => void;
 }
 
@@ -41,7 +41,7 @@ export const usePKStore = create<PKState>()((set) => ({
 
   acceptBattle: async (battleId: string) => {
     try {
-      const res = await api.post(`/pk-battles/${battleId}/accept`);
+      const res = await api.post(`/pk-battles/${battleId}/accept`, { accept: true });
       set({ currentBattle: res.data });
     } catch (err) {
       set({ error: getErrorMessage(err) });
@@ -72,7 +72,8 @@ export const usePKStore = create<PKState>()((set) => ({
     set({ isLoading: true, error: null });
     try {
       const res = await api.get('/pk-battles/active');
-      set({ activeBattles: res.data.battles || res.data || [], isLoading: false });
+      const raw = res.data?.battles ?? res.data;
+      set({ activeBattles: Array.isArray(raw) ? raw : [], isLoading: false });
     } catch (err) {
       set({ error: getErrorMessage(err), isLoading: false });
     }
@@ -82,6 +83,7 @@ export const usePKStore = create<PKState>()((set) => ({
     try {
       const res = await api.get(`/pk-battles/${id}`);
       set({ currentBattle: res.data });
+      return res.data;
     } catch (err) {
       set({ error: getErrorMessage(err) });
     }

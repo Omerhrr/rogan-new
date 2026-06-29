@@ -4,11 +4,10 @@ services:
     image: postgres:16-alpine
     container_name: rogan-postgres
     environment:
-      POSTGRES_DB: rogan_live
-      POSTGRES_USER: rogan
-      POSTGRES_PASSWORD: rogan_secret
-    ports:
-      - "5432:5432"
+      POSTGRES_DB: ${POSTGRES_DB:-rogan_live}
+      POSTGRES_USER: ${POSTGRES_USER:-rogan}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set in .env}
+    # No host port binding — backend reaches postgres via Docker DNS (internal only)
     volumes:
       - pgdata:/var/lib/postgresql/data
     healthcheck:
@@ -21,8 +20,8 @@ services:
   redis:
     image: redis:7-alpine
     container_name: rogan-redis
-    ports:
-      - "6379:6379"
+    # Port 6379 is only exposed internally; remove host binding to avoid conflicts
+    # with any Redis already running on the host. Backend reaches it via Docker DNS.
     volumes:
       - redisdata:/data
     healthcheck:
@@ -37,11 +36,12 @@ services:
       context: ./backend
       dockerfile: Dockerfile
     container_name: rogan-migrate
-    command: >
-      sh -c "alembic upgrade head"
+    command: bash /app/wait-and-migrate.sh
     environment:
-      DATABASE_URL: postgresql://rogan:rogan_secret@postgres:5432/rogan_live
+      DATABASE_URL: postgresql://${POSTGRES_USER:-rogan}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-rogan_live}
       REDIS_URL: redis://redis:6379/0
+    volumes:
+      - ./backend:/app
     depends_on:
       postgres:
         condition: service_healthy
@@ -54,19 +54,28 @@ services:
       context: ./backend
       dockerfile: Dockerfile
     container_name: rogan-backend
-    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --workers 4
     ports:
       - "8000:8000"
     environment:
-      DATABASE_URL: postgresql://rogan:rogan_secret@postgres:5432/rogan_live
+      DATABASE_URL: postgresql://${POSTGRES_USER:-rogan}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-rogan_live}
       REDIS_URL: redis://redis:6379/0
-      JWT_SECRET: ${JWT_SECRET:-rogan-live-production-secret-change-me}
+      JWT_SECRET: ${JWT_SECRET:?JWT_SECRET must be set in .env}
       GOOGLE_CLIENT_ID: ${GOOGLE_CLIENT_ID:-}
       GOOGLE_CLIENT_SECRET: ${GOOGLE_CLIENT_SECRET:-}
-      CORS_ORIGINS: '["http://localhost:5173","http://localhost:3000","http://localhost:8000"]'
+      CORS_ORIGINS: ${CORS_ORIGINS:-'["http://localhost:3000"]'}
       MEDIAMTX_HOST: mediamtx
+      MEDIAMTX_PUBLIC_HLS_BASE: ${MEDIAMTX_PUBLIC_HLS_BASE:-http://localhost:8888}
+      USE_ALEMBIC: "true"
+      PUBLIC_BASE_URL: ${PUBLIC_BASE_URL:-http://localhost:8000}
+      # Wallet / crypto
+      PLATFORM_WALLET_ADDRESS: ${PLATFORM_WALLET_ADDRESS:-}
+      ROGAN_CONTRACT_ADDRESS: ${ROGAN_CONTRACT_ADDRESS:-0x6914D994d82Bf0cC9d64cF32978d81868Ac5f1a9}
+      ROGAN_DEXSCREENER_PAIR: ${ROGAN_DEXSCREENER_PAIR:-0x1b0fb286fd0f0b48e9af0a5b7bdd2fabda60a55a}
+      BASE_RPC_URL: ${BASE_RPC_URL:-https://mainnet.base.org}
     volumes:
-      - ./backend:/app
+      - voicedata:/app/media/voice
+      - ./backend/media:/app/media
     depends_on:
       alembic-migrate:
         condition: service_completed_successfully
@@ -89,31 +98,47 @@ services:
       - "5173:5173"
     environment:
       NEXT_PUBLIC_API_URL: http://backend:8000
-      NEXT_PUBLIC_WS_URL: ws://localhost:8000
+      NEXT_PUBLIC_WS_URL: ${NEXT_PUBLIC_WS_URL:-ws://localhost:8000}
+      # Server-side proxy targets (Docker internal DNS — never sent to browser)
+      MEDIAMTX_HLS_URL: http://mediamtx:8888
+      MEDIAMTX_WHIP_URL: http://mediamtx:8889
+      MEDIAMTX_API_URL: http://mediamtx:9997
+      # Legacy env kept for backward compat
       NEXT_PUBLIC_MEDIAMTX_URL: http://mediamtx:8888
+      WATCHPACK_POLLING: "true"
     volumes:
       - ./frontend/src:/app/src
       - ./frontend/public:/app/public
+      - ./frontend/tailwind.config.ts:/app/tailwind.config.ts
+      - ./frontend/postcss.config.mjs:/app/postcss.config.mjs
+      - ./frontend/next.config.ts:/app/next.config.ts
     depends_on:
       backend:
         condition: service_healthy
 
   # ─── MediaMTX (RTMP → LL-HLS + WebRTC) ──────────────────────
+  #
+  # LOCAL DEV (Docker Desktop / WSL2): bridge network with explicit port mappings.
+  # WebRTC ICE strategy: TCP mux on 8190 works reliably via Docker DNAT.
   mediamtx:
-    image: bluenviron/mediamtx:v1.19.0
+    image: bluenviron/mediamtx:latest
     container_name: rogan-mediamtx
+    restart: unless-stopped
     ports:
       - "1935:1935"   # RTMP ingest
-      - "8888:8888"   # LL-HLS
-      - "8889:8889"   # WebRTC
-      - "9997:9997"   # API
+      - "8888:8888"   # HLS playback
+      - "8889:8889"   # WebRTC WHIP/WHEP (HTTP signalling)
+      - "8189:8189/udp" # WebRTC ICE UDP mux
+      - "8190:8190"     # WebRTC ICE TCP mux
+      - "127.0.0.1:9997:9997"  # MediaMTX API — localhost only, not public
+    environment:
+      MTX_WEBRTCADDITIONALHOSTS: ${WEBRTC_HOST:-127.0.0.1}
     volumes:
       - ./backend/config/mediamtx.yml:/mediamtx.yml:ro
-      - mediamtxdata:/mediamtx-recordings
-    depends_on:
-      - backend
+      - mediamtxdata:/recordings
 
 volumes:
   pgdata:
   redisdata:
+  voicedata:
   mediamtxdata:

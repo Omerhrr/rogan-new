@@ -4,6 +4,7 @@ Handles registration, login, Google OAuth, and JWT token management.
 Uses bcrypt directly (avoiding passlib compatibility issues with bcrypt 5.x).
 """
 
+import secrets as _secrets
 from datetime import datetime, timedelta
 from typing import Optional, Tuple
 
@@ -14,6 +15,10 @@ from sqlalchemy.orm import Session
 
 from app.config import settings
 from app.models.models import User
+from app.utils.redis_client import redis_client
+
+_RESET_TOKEN_TTL = 900  # 15 minutes
+_RESET_KEY_PREFIX = "password_reset:"
 
 
 def _hash_password(password: str) -> str:
@@ -109,10 +114,10 @@ def login_user(db: Session, email: str, password: str) -> Tuple[User, str]:
 def google_oauth(db: Session, google_token: str) -> Tuple[User, str]:
     """Verify Google ID token, create or find user, return JWT token."""
     try:
-        from google.oauth2 import idinfo
+        from google.oauth2 import id_token
         from google.auth.transport import requests as google_requests
 
-        idinfo_dict = idinfo.verify_oauth2_token(
+        idinfo_dict = id_token.verify_oauth2_token(
             google_token,
             google_requests.Request(),
             settings.GOOGLE_CLIENT_ID,
@@ -201,6 +206,67 @@ def google_oauth(db: Session, google_token: str) -> Tuple[User, str]:
 
     token = _create_jwt_token(user)
     return user, token
+
+
+def request_password_reset(db: Session, email: str) -> str:
+    """Generate a 15-minute password reset token and store it in Redis.
+
+    Returns the token so callers can include it in an email or (dev mode)
+    return it directly in the API response.
+
+    Raises HTTP 404 if the email is not registered, so callers that want
+    to avoid email enumeration should catch and suppress this.
+    """
+    user = db.query(User).filter(User.email == email).first()
+    if not user:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="No account registered with that email address",
+        )
+
+    if not user.password_hash:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="This account uses Google login — password reset is not available",
+        )
+
+    token = _secrets.token_urlsafe(32)
+    redis_client.setex(f"{_RESET_KEY_PREFIX}{token}", _RESET_TOKEN_TTL, user.id)
+    return token
+
+
+def reset_password(db: Session, token: str, new_password: str) -> User:
+    """Validate a reset token from Redis and update the user's password.
+
+    The token is deleted from Redis on first use (single-use).
+    """
+    if len(new_password) < 8:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="Password must be at least 8 characters",
+        )
+
+    user_id: Optional[str] = redis_client.get(f"{_RESET_KEY_PREFIX}{token}")
+    if not user_id:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Reset token is invalid or has expired",
+        )
+
+    user = db.query(User).filter(User.id == user_id).first()
+    if not user:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="User not found",
+        )
+
+    user.password_hash = _hash_password(new_password)
+    db.commit()
+    db.refresh(user)
+
+    # Invalidate token — single use
+    redis_client.delete(f"{_RESET_KEY_PREFIX}{token}")
+    return user
 
 
 def get_current_user(db: Session, token: str) -> User:

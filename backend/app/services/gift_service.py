@@ -11,7 +11,7 @@ from sqlalchemy.orm import Session
 
 from app.models.models import Gift, Stream, User
 from app.services.economy_service import GIFT_PRICES, get_gift_price, validate_gift_type
-from app.services.ledger_service import get_tk_balance, process_gift
+from app.services.ledger_service import get_tk_balance, process_gift  # get_tk_balance used for post-debit balance read
 
 
 def send_gift(
@@ -29,12 +29,17 @@ def send_gift(
             detail=f"Invalid gift type. Valid types: {list(GIFT_PRICES.keys())}",
         )
 
-    # Validate stream exists and is live
+    # Validate stream exists and is currently live
     stream = db.query(Stream).filter(Stream.id == stream_id).first()
     if not stream:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Stream not found",
+        )
+    if not stream.is_live:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Cannot send gifts to a stream that is not live",
         )
 
     receiver_id = stream.creator_id
@@ -49,15 +54,10 @@ def send_gift(
     # Get TK price
     tk_amount = get_gift_price(gift_type)
 
-    # Check sender balance before creating gift
-    balance = get_tk_balance(db, sender_id)
-    if balance < tk_amount:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Insufficient TK balance. Current: {balance} TK, Gift cost: {tk_amount} TK",
-        )
-
-    # Create gift record
+    # Create gift record with flush only — NOT committed yet.
+    # This ensures that if the ledger transaction fails (e.g. concurrent spend
+    # drains the balance between our check and debit), the gift record is
+    # also rolled back, preventing orphaned Gift rows with no ledger entry.
     gift = Gift(
         stream_id=stream_id,
         sender_id=sender_id,
@@ -67,10 +67,11 @@ def send_gift(
         message=message or None,
     )
     db.add(gift)
-    db.commit()
-    db.refresh(gift)
+    db.flush()  # Assigns gift.id; rolled back atomically if process_gift() raises
 
-    # Process ledger transaction
+    # Authoritative balance check + debit via row-level locked ledger transaction.
+    # If this raises (insufficient balance after locking), the flushed gift is
+    # also rolled back by the exception handler unwinding the DB session.
     sender_tx, creator_earnings = process_gift(
         db=db,
         sender_id=sender_id,
@@ -78,6 +79,7 @@ def send_gift(
         tk_amount=tk_amount,
         gift_id=gift.id,
     )
+    db.refresh(gift)
 
     # Get updated balances
     sender_balance = get_tk_balance(db, sender_id)

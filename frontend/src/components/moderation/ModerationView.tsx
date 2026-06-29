@@ -18,7 +18,7 @@ export default function ModerationView() {
 
   useEffect(() => {
     if (user?.role !== 'admin') { setIsLoading(false); return; }
-    api.get('/moderation/reports/')
+    api.get('/moderation/reports')
       .then((res) => setReports(res.data.reports || res.data || []))
       .catch(() => {})
       .finally(() => setIsLoading(false));

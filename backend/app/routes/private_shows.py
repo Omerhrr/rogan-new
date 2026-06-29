@@ -7,6 +7,8 @@ GET /private-shows/active — List active private shows
 GET /private-shows/{show_id} — Show details + viewer count
 """
 
+import json
+
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy.orm import Session
 
@@ -15,11 +17,12 @@ from app.models.models import User
 from app.routes.auth import get_current_user_dependency
 from app.schemas import PrivateShowCreate, PrivateShowJoin
 from app.services import private_show_service
+from app.utils.redis_client import redis_client
 
 router = APIRouter(prefix="/private-shows", tags=["Private Shows"])
 
 
-@router.post("/", status_code=status.HTTP_201_CREATED)
+@router.post("", status_code=status.HTTP_201_CREATED)
 def start_private_show(
     req: PrivateShowCreate,
     current_user: User = Depends(get_current_user_dependency),
@@ -52,18 +55,27 @@ def join_private_show(
     Viewers cannot join their own show. A viewer can only join once.
     If the show is in 'waiting' status, it transitions to 'live'.
     """
-    viewer_entry = private_show_service.join_private_show(
+    viewer_entry, show = private_show_service.join_private_show(
         db=db,
         show_id=show_id,
         viewer_id=current_user.id,
     )
+    # Return stream URLs so the viewer can open the player immediately.
+    # Proxied paths: /live/:key (HLS) and /whep/:key (WebRTC) go through Next.js
+    # rewrites → MediaMTX, so they work from the browser without CORS issues.
+    hls_url = f"/live/{show.stream_key}/index.m3u8" if show.stream_key else None
+    whep_url = f"/whep/{show.stream_key}" if show.stream_key else None
     return {
         "id": viewer_entry.id,
         "show_id": viewer_entry.show_id,
         "viewer_id": viewer_entry.viewer_id,
         "paid_amount": viewer_entry.paid_amount,
         "joined_at": viewer_entry.joined_at.isoformat() if viewer_entry.joined_at else None,
-        "message": "Successfully joined the private show",
+        "stream_key": show.stream_key,
+        "hls_url": hls_url,
+        "whep_url": whep_url,
+        "show_status": show.status,
+        "message": "Joined private show",
     }
 
 
@@ -113,20 +125,54 @@ def get_private_show_details(
     return private_show_service.get_show_details(db=db, show_id=show_id)
 
 
-def _show_response(show, db: Session) -> dict:
-    """Format a PrivateShow model into a response dict."""
-    viewer_count = private_show_service._get_viewer_count(db, show.id)
+@router.get("/{show_id}/access")
+def get_private_show_access(
+    show_id: str,
+    current_user: User = Depends(get_current_user_dependency),
+    db: Session = Depends(get_db),
+):
+    """Check if the current user has paid access to this private show."""
+    return private_show_service.check_private_show_access(db, show_id, current_user.id)
+
+
+@router.get("/{show_id}/chat/history")
+def get_chat_history(
+    show_id: str,
+    current_user: User = Depends(get_current_user_dependency),
+    db: Session = Depends(get_db),
+):
+    """Return up to 200 most recent chat messages for a private show.
+
+    Messages are stored in Redis as the show runs and expire after 24 h.
+    Only participants (creator or joined viewer) may fetch history.
+    """
+    # Verify the show exists
+    show = private_show_service.get_show_details(db=db, show_id=show_id)
+
+    # Auth: creator or joined viewer
+    is_creator = show["creator_id"] == current_user.id
+    if not is_creator:
+        from app.models.models import PrivateShowViewer
+        joined = db.query(PrivateShowViewer).filter(
+            PrivateShowViewer.show_id == show_id,
+            PrivateShowViewer.viewer_id == current_user.id,
+        ).first()
+        if not joined:
+            raise HTTPException(status_code=403, detail="Not joined")
+
+    messages = db.query(PrivateShowMessage).filter(
+        PrivateShowMessage.show_id == show_id,
+    ).order_by(PrivateShowMessage.created_at).limit(100).all()
+
     return {
-        "id": show.id,
-        "creator_id": show.creator_id,
-        "stream_key": show.stream_key,
-        "price_tk": show.price_tk,
-        "duration_minutes": show.duration_minutes,
-        "max_viewers": show.max_viewers,
-        "status": show.status,
-        "viewer_count": viewer_count,
-        "started_at": show.started_at.isoformat() if show.started_at else None,
-        "ended_at": show.ended_at.isoformat() if show.ended_at else None,
-        "total_revenue": show.total_revenue,
-        "created_at": show.created_at.isoformat() if show.created_at else None,
+        "messages": [
+            {
+                "id": str(m.id),
+                "user_id": str(m.user_id),
+                "username": m.user.username if m.user else "unknown",
+                "content": m.content,
+                "created_at": m.created_at.isoformat() if m.created_at else None,
+            }
+            for m in messages
+        ]
     }

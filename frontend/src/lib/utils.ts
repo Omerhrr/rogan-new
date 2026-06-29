@@ -18,9 +18,17 @@ export function formatCount(count: number): string {
   return count.toString();
 }
 
+/** Normalise a datetime string — append Z if no timezone info so it's parsed as UTC. */
+function parseUTC(date: string | Date): Date {
+  if (date instanceof Date) return date;
+  // If already has timezone offset (Z, +HH:MM, -HH:MM) leave it alone
+  if (/Z$|[+-]\d{2}:\d{2}$/.test(date)) return new Date(date);
+  return new Date(date + 'Z');
+}
+
 export function timeAgo(date: string | Date): string {
   const now = new Date();
-  const past = new Date(date);
+  const past = parseUTC(date);
   const diff = now.getTime() - past.getTime();
   const seconds = Math.floor(diff / 1000);
   const minutes = Math.floor(seconds / 60);
@@ -31,6 +39,36 @@ export function timeAgo(date: string | Date): string {
   if (hours > 0) return `${hours}h ago`;
   if (minutes > 0) return `${minutes}m ago`;
   return 'just now';
+}
+
+/**
+ * WhatsApp-style time for DM messages:
+ *  - Today       → "14:32"
+ *  - Yesterday   → "Yesterday"
+ *  - This week   → "Mon"
+ *  - Older       → "01/06/26"
+ */
+export function formatMessageTime(date: string | Date): string {
+  const d = parseUTC(date);
+  const now = new Date();
+
+  const sameDay = (a: Date, b: Date) =>
+    a.getFullYear() === b.getFullYear() &&
+    a.getMonth() === b.getMonth() &&
+    a.getDate() === b.getDate();
+
+  if (sameDay(d, now)) {
+    return d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+  }
+
+  const yesterday = new Date(now);
+  yesterday.setDate(yesterday.getDate() - 1);
+  if (sameDay(d, yesterday)) return 'Yesterday';
+
+  const daysAgo = Math.floor((now.getTime() - d.getTime()) / 86400000);
+  if (daysAgo < 7) return d.toLocaleDateString([], { weekday: 'short' });
+
+  return d.toLocaleDateString([], { day: '2-digit', month: '2-digit', year: '2-digit' });
 }
 
 export function generateAvatar(name: string): string {

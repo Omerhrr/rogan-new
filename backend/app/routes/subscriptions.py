@@ -37,12 +37,26 @@ def _tier_to_response(tier) -> Dict[str, Any]:
     }
 
 
-def _sub_to_response(sub) -> Dict[str, Any]:
+def _sub_to_response(sub, db: Session = None) -> Dict[str, Any]:
     """Convert a Subscription model to a response dict."""
+    creator_username = None
+    creator_display_name = None
+    subscriber_username = None
+    if db:
+        creator = db.query(User).filter(User.id == sub.creator_id).first()
+        if creator:
+            creator_username = creator.username
+            creator_display_name = creator.display_name
+        subscriber = db.query(User).filter(User.id == sub.subscriber_id).first()
+        if subscriber:
+            subscriber_username = subscriber.username
     return {
         "id": sub.id,
         "subscriber_id": sub.subscriber_id,
+        "subscriber_username": subscriber_username,
         "creator_id": sub.creator_id,
+        "creator_username": creator_username,
+        "creator_display_name": creator_display_name,
         "tier_id": sub.tier_id,
         "tier": sub.tier,
         "price": sub.price,
@@ -58,7 +72,7 @@ def _sub_to_response(sub) -> Dict[str, Any]:
 # ─── Tier Management ─────────────────────────────────────────────
 
 
-@router.post("/tiers/", status_code=status.HTTP_201_CREATED)
+@router.post("/tiers", status_code=status.HTTP_201_CREATED)
 def create_tier(
     req: SubscriptionTierCreate,
     current_user: User = Depends(get_current_user_dependency),
@@ -89,7 +103,7 @@ def list_creator_tiers(
 # ─── Subscription Lifecycle ──────────────────────────────────────
 
 
-@router.post("/subscribe/", status_code=status.HTTP_201_CREATED)
+@router.post("/subscribe", status_code=status.HTTP_201_CREATED)
 def subscribe(
     req: SubscribeRequest,
     current_user: User = Depends(get_current_user_dependency),
@@ -104,7 +118,7 @@ def subscribe(
         tier_name=req.tier,
         auto_renew=req.auto_renew,
     )
-    return _sub_to_response(subscription)
+    return _sub_to_response(subscription, db)
 
 
 @router.delete("/{subscription_id}")
@@ -119,7 +133,7 @@ def cancel_subscription(
         subscription_id=subscription_id,
         subscriber_id=current_user.id,
     )
-    return {**_sub_to_response(subscription), "message": "Subscription cancelled"}
+    return {**_sub_to_response(subscription, db), "message": "Subscription cancelled"}
 
 
 @router.get("/me")
@@ -134,7 +148,7 @@ def get_my_subscriptions(
         db=db, subscriber_id=current_user.id, page=page, limit=limit
     )
     return {
-        "subscriptions": [_sub_to_response(s) for s in result["subscriptions"]],
+        "subscriptions": [_sub_to_response(s, db) for s in result["subscriptions"]],
         "total": result["total"],
         "page": result["page"],
         "limit": result["limit"],
@@ -160,7 +174,7 @@ def get_my_subscribers(
         db=db, creator_id=current_user.id, page=page, limit=limit
     )
     return {
-        "subscribers": [_sub_to_response(s) for s in result["subscribers"]],
+        "subscribers": [_sub_to_response(s, db) for s in result["subscribers"]],
         "total": result["total"],
         "page": result["page"],
         "limit": result["limit"],

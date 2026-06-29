@@ -1,8 +1,9 @@
 'use client';
 
-import { 
-  Radio, Video, Wallet, MessageSquare, Store, Crown, 
-  LayoutDashboard, Shield, ChevronLeft, ChevronRight 
+import {
+  Radio, Video, Wallet, MessageSquare,
+  LayoutDashboard, Shield, ChevronLeft, ChevronRight,
+  Lock, Settings
 } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import { useAuthStore } from '@/stores/authStore';
@@ -16,14 +17,15 @@ interface SidebarProps {
 }
 
 const NAV_ITEMS: { view: ViewType; label: string; icon: React.ComponentType<{ className?: string }>; roles?: string[] }[] = [
-  { view: 'feed', label: 'Live Feed', icon: Radio },
-  { view: 'golive', label: 'Go Live', icon: Video, roles: ['creator', 'admin'] },
-  { view: 'wallet', label: 'Wallet', icon: Wallet },
-  { view: 'messages', label: 'Messages', icon: MessageSquare },
-  { view: 'marketplace', label: 'Marketplace', icon: Store },
-  { view: 'subscriptions', label: 'Subscriptions', icon: Crown },
-  { view: 'dashboard', label: 'Dashboard', icon: LayoutDashboard, roles: ['creator', 'admin'] },
-  { view: 'moderation', label: 'Moderation', icon: Shield, roles: ['admin'] },
+  { view: 'feed',           label: 'Live Feed',     icon: Radio },
+  { view: 'golive',         label: 'Go Live',        icon: Video,          roles: ['creator', 'admin'] },
+  { view: 'private-shows',  label: 'Private Shows',  icon: Lock },
+
+  { view: 'messages',       label: 'Messages',       icon: MessageSquare },
+  { view: 'wallet',         label: 'Wallet',         icon: Wallet },
+  { view: 'dashboard',      label: 'Dashboard',      icon: LayoutDashboard, roles: ['creator', 'admin'] },
+  { view: 'settings',       label: 'Settings',       icon: Settings },
+  { view: 'moderation',     label: 'Admin Panel',    icon: Shield,         roles: ['admin', 'moderator'] },
 ];
 
 export default function Sidebar({ activeView, onViewChange }: SidebarProps) {

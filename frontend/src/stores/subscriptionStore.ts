@@ -42,7 +42,7 @@ export const useSubscriptionStore = create<SubscriptionState>()((set) => ({
   createTier: async (data) => {
     set({ isLoading: true, error: null });
     try {
-      await api.post('/subscriptions/tiers/', data);
+      await api.post('/subscriptions/tiers', data);
       set({ isLoading: false });
     } catch (err) {
       set({ error: getErrorMessage(err), isLoading: false });
@@ -53,7 +53,7 @@ export const useSubscriptionStore = create<SubscriptionState>()((set) => ({
   subscribe: async (data) => {
     set({ isLoading: true, error: null });
     try {
-      await api.post('/subscriptions/subscribe/', data);
+      await api.post('/subscriptions/subscribe', data);
       set({ isLoading: false });
     } catch (err) {
       set({ error: getErrorMessage(err), isLoading: false });

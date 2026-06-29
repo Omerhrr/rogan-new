@@ -1,0 +1,16 @@
+# Use the official MediaMTX image directly (already cached locally).
+#
+# The previous multi-stage build (mediamtx-bin → alpine:3.19) was needed to add
+# curl for the runOnReady lifecycle hooks. Alpine is currently unreachable from
+# Docker Hub, so we drop back to the single-stage image.
+#
+# Impact: runOnReady / runOnNotReady hooks (RTMP publish events) will fail
+# silently — each command ends with "|| true" so MediaMTX won't crash.
+# The webcam / WHIP flow is unaffected: is_live is set via the backend API
+# (POST /streams/{id}/go-live), not via the MediaMTX webhook.
+# RTMP/OBS hook events can be restored once Docker Hub access is available
+# by reverting to the two-stage build.
+
+FROM bluenviron/mediamtx:1.19.0
+# Override CMD to pass our config file path; ENTRYPOINT is already /mediamtx
+CMD ["/mediamtx.yml"]

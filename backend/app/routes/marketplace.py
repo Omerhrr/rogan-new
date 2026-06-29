@@ -45,7 +45,7 @@ def _product_to_response(p: MarketplaceProduct, include_file: bool = False) -> D
 # ─── Product CRUD ─────────────────────────────────────────────────
 
 
-@router.post("/products/", status_code=status.HTTP_201_CREATED)
+@router.post("/products", status_code=status.HTTP_201_CREATED)
 def create_product(
     req: MarketplaceProductCreate,
     current_user: User = Depends(get_current_user_dependency),
@@ -65,7 +65,7 @@ def create_product(
     return _product_to_response(product, include_file=True)
 
 
-@router.get("/products/")
+@router.get("/products")
 def browse_products(
     page: int = Query(1, ge=1),
     limit: int = Query(20, ge=1, le=100),

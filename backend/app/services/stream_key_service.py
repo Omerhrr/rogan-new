@@ -67,18 +67,21 @@ def create_stream_key(
 
 
 def get_user_stream_keys(db: Session, user_id: str) -> List[StreamKey]:
-    """Get all stream keys belonging to a user.
+    """Get active stream keys belonging to a user.
+
+    Revoked keys (is_active=False) are excluded so they don't reappear
+    in the UI after deletion.
 
     Args:
         db: Database session.
         user_id: Owner of the keys.
 
     Returns:
-        List of StreamKey objects (both active and revoked).
+        List of active StreamKey objects.
     """
     return (
         db.query(StreamKey)
-        .filter(StreamKey.user_id == user_id)
+        .filter(StreamKey.user_id == user_id, StreamKey.is_active == True)
         .order_by(StreamKey.created_at.desc())
         .all()
     )
@@ -224,8 +227,6 @@ def validate_stream_key_for_path(db: Session, path: str) -> Optional[Dict[str, A
         return None
 
     return {
-        "user_id": stream_key.user_id,
-        "key_id": stream_key.id,
-        "key": stream_key.key,
-        "label": stream_key.label,
+        "user_id": str(stream_key.user_id),
+        "stream_key": stream_key.stream_key,
     }

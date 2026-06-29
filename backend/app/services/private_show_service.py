@@ -83,13 +83,27 @@ def create_private_show(
             detail="You already have an active private show. End it before starting a new one.",
         )
 
-    # Get or create a stream key for this private show
+    # Get the creator's active stream key for WHIP publishing.
+    # If none exists, create one automatically so the show always has a key.
+    import uuid as _uuid
     stream_key_record = (
         db.query(StreamKey)
         .filter(StreamKey.user_id == creator_id, StreamKey.is_active == True)
         .first()
     )
-    stream_key_str = stream_key_record.key if stream_key_record else None
+    if stream_key_record:
+        stream_key_str = stream_key_record.key
+    else:
+        # Auto-create a stream key so the creator can publish immediately
+        new_key = StreamKey(
+            user_id=creator_id,
+            key=str(_uuid.uuid4()),
+            label="Private Show Key",
+            is_active=True,
+        )
+        db.add(new_key)
+        db.flush()  # assign ID without committing yet
+        stream_key_str = new_key.key
 
     show = PrivateShow(
         creator_id=creator_id,
@@ -139,7 +153,7 @@ def join_private_show(
             detail="Private show not found",
         )
 
-    if show.status not in ("waiting", "live"):
+    if show.status not in ("waiting", "announced", "live"):
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="This show is no longer accepting viewers",
@@ -160,7 +174,8 @@ def join_private_show(
             detail="This show has reached its viewer capacity",
         )
 
-    # Check if already joined
+    # Check if already joined — idempotent re-join (e.g. page refresh).
+    # Return the existing entry + stream URLs without charging again.
     existing = (
         db.query(PrivateShowViewer)
         .filter(
@@ -170,10 +185,7 @@ def join_private_show(
         .first()
     )
     if existing:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="You have already joined this show",
-        )
+        return existing, show
 
     # Check viewer balance with lock to prevent TOCTOU
     balance = get_tk_balance_with_lock(db, viewer_id)
@@ -238,7 +250,7 @@ def join_private_show(
     # Publish event
     _publish_show_event("private_show_joined", show, viewer_id=viewer_id)
 
-    return viewer_entry
+    return viewer_entry, show
 
 
 def end_private_show(db: Session, show_id: str, creator_id: str) -> PrivateShow:
@@ -326,6 +338,7 @@ def get_active_shows(
                 "display_name": creator.display_name,
                 "avatar": creator.avatar,
             } if creator else None,
+            "stream_key": show.stream_key,  # needed by creator for WHIP publishing
             "price_tk": show.price_tk,
             "duration_minutes": show.duration_minutes,
             "max_viewers": show.max_viewers,
@@ -368,12 +381,14 @@ def get_show_details(db: Session, show_id: str) -> Dict[str, Any]:
     viewer_count = _get_viewer_count(db, show.id)
     creator = db.query(User).filter(User.id == show.creator_id).first()
 
-    # Build WebRTC stream URL if show is live
-    webrtc_url = None
-    hls_url = None
-    if show.status == "live" and show.stream_key:
-        webrtc_url = f"ws://{settings.MEDIAMTX_HOST}:{settings.MEDIAMTX_WEBRTC_PORT}/{show.stream_key}/ws"
-        hls_url = f"http://{settings.MEDIAMTX_HOST}:{settings.MEDIAMTX_HLS_PORT}/{show.stream_key}/index.m3u8"
+    # Build stream URLs using Next.js-proxied paths (same origin — no CORS, no Docker DNS).
+    # These paths are proxied by Next.js rewrites:
+    #   /live/:key  → mediamtx:8888  (LL-HLS)
+    #   /whep/:key  → mediamtx:8889  (WebRTC WHEP for viewers)
+    #   /whip/:key  → mediamtx:8889  (WebRTC WHIP for creator)
+    hls_url = f"/live/{show.stream_key}/index.m3u8" if show.stream_key else None
+    whep_url = f"/whep/{show.stream_key}" if show.stream_key else None
+    whip_url = f"/whip/{show.stream_key}" if show.stream_key else None
 
     return {
         "id": show.id,
@@ -393,8 +408,9 @@ def get_show_details(db: Session, show_id: str) -> Dict[str, Any]:
         "started_at": show.started_at.isoformat() if show.started_at else None,
         "ended_at": show.ended_at.isoformat() if show.ended_at else None,
         "total_revenue": show.total_revenue,
-        "webrtc_url": webrtc_url,
         "hls_url": hls_url,
+        "whep_url": whep_url,
+        "whip_url": whip_url,
         "created_at": show.created_at.isoformat() if show.created_at else None,
     }
 
@@ -481,18 +497,143 @@ async def _auto_end_task(show_id: str, delay_minutes: int) -> None:
         logger.error(f"Auto-end task failed for show {show_id}: {e}")
 
 
+def announce_live_to_private(
+    db: Session,
+    stream_id: str,
+    creator_id: str,
+    price_tk: float,
+    countdown_seconds: int,
+    duration_minutes: int = 60,
+) -> PrivateShow:
+    """Create an 'announced' PrivateShow linked to an active live stream."""
+    from app.models.models import Stream
+    stream = db.query(Stream).filter(
+        Stream.id == stream_id, Stream.creator_id == creator_id, Stream.is_live == True
+    ).first()
+    if not stream:
+        raise HTTPException(status_code=404, detail="Live stream not found or not yours")
+    # Cancel any existing announced show
+    if stream.active_private_show_id:
+        old = db.query(PrivateShow).filter(PrivateShow.id == stream.active_private_show_id).first()
+        if old and old.status in ('announced',):
+            old.status = 'ended'
+    show = PrivateShow(
+        creator_id=creator_id,
+        live_stream_id=stream_id,
+        stream_key=stream.stream_key,
+        price_tk=price_tk,
+        duration_minutes=duration_minutes,
+        countdown_seconds=countdown_seconds,
+        max_viewers=None,
+        status='announced',
+        announced_at=datetime.utcnow(),
+    )
+    db.add(show)
+    db.flush()
+    stream.active_private_show_id = show.id
+    db.commit()
+    db.refresh(show)
+    return show
+
+
+def start_announced_show(db: Session, stream_id: str, creator_id: str) -> PrivateShow:
+    """Transition announced to live."""
+    from app.models.models import Stream
+    stream = db.query(Stream).filter(Stream.id == stream_id, Stream.creator_id == creator_id).first()
+    if not stream or not stream.active_private_show_id:
+        raise HTTPException(status_code=404, detail="No announced private show")
+    show = db.query(PrivateShow).filter(PrivateShow.id == stream.active_private_show_id).first()
+    if not show:
+        raise HTTPException(status_code=404, detail="Show not found")
+    # Idempotent: if already live (e.g. countdown fired twice), return it
+    if show.status == 'live':
+        return show
+    if show.status != 'announced':
+        raise HTTPException(status_code=400, detail="Show is not in announced state")
+    show.status = 'live'
+    show.started_at = datetime.utcnow()
+    db.commit()
+    db.refresh(show)
+    return show
+
+
+def cancel_announced_show(db: Session, stream_id: str, creator_id: str) -> None:
+    """Cancel an announced private show (streamer changed their mind)."""
+    from app.models.models import Stream
+    stream = db.query(Stream).filter(Stream.id == stream_id, Stream.creator_id == creator_id).first()
+    if not stream or not stream.active_private_show_id:
+        return
+    show = db.query(PrivateShow).filter(PrivateShow.id == stream.active_private_show_id).first()
+    if show:
+        show.status = 'ended'
+    stream.active_private_show_id = None
+    db.commit()
+
+
+def end_live_private_show(db: Session, stream_id: str, creator_id: str) -> None:
+    """End a live private show and return stream to public."""
+    from app.models.models import Stream
+    stream = db.query(Stream).filter(Stream.id == stream_id, Stream.creator_id == creator_id).first()
+    if not stream or not stream.active_private_show_id:
+        return
+    show = db.query(PrivateShow).filter(PrivateShow.id == stream.active_private_show_id).first()
+    if show:
+        show.status = 'ended'
+        show.ended_at = datetime.utcnow()
+        show.total_revenue = _calculate_revenue(db, show.id, show.price_tk)
+    stream.active_private_show_id = None
+    db.commit()
+
+
+def check_private_show_access(db: Session, show_id: str, user_id: str) -> dict:
+    """Return whether a user has paid access to a private show."""
+    show = db.query(PrivateShow).filter(PrivateShow.id == show_id).first()
+    if not show:
+        raise HTTPException(status_code=404, detail="Show not found")
+    is_creator = show.creator_id == user_id
+    is_viewer = db.query(PrivateShowViewer).filter(
+        PrivateShowViewer.show_id == show_id,
+        PrivateShowViewer.viewer_id == user_id,
+    ).first() is not None
+    return {
+        "has_access": is_creator or is_viewer,
+        "is_creator": is_creator,
+        "show_id": show_id,
+        "status": show.status,
+        "price_tk": show.price_tk,
+    }
+
+
+def get_stream_private_show(db: Session, stream_id: str):
+    """Get the active private show for a live stream (if any)."""
+    from app.models.models import Stream
+    stream = db.query(Stream).filter(Stream.id == stream_id).first()
+    if not stream or not stream.active_private_show_id:
+        return None
+    show = db.query(PrivateShow).filter(PrivateShow.id == stream.active_private_show_id).first()
+    if not show or show.status == 'ended':
+        return None
+    return {
+        "show_id": show.id,
+        "status": show.status,
+        "price_tk": show.price_tk,
+        "countdown_seconds": show.countdown_seconds,
+        "announced_at": show.announced_at.isoformat() if show.announced_at else None,
+        "started_at": show.started_at.isoformat() if show.started_at else None,
+    }
+
+
+def _calculate_revenue(db: Session, show_id: str, price_tk: float) -> float:
+    viewers = db.query(PrivateShowViewer).filter(PrivateShowViewer.show_id == show_id).all()
+    return sum(v.paid_amount for v in viewers)
+
+
 def _publish_show_event(
     event_type: str,
     show: PrivateShow,
-    viewer_id: Optional[str] = None,
+    viewer_id=None,
 ) -> None:
-    """Publish a private show event via Redis PubSub.
-
-    Args:
-        event_type: The event type.
-        show: The PrivateShow object.
-        viewer_id: Optional viewer ID for join events.
-    """
+    """Publish a private show event via Redis PubSub."""
     event = {
         "type": event_type,
         "data": {

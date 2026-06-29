@@ -34,7 +34,7 @@ export const useMarketplaceStore = create<MarketplaceState>()((set) => ({
   fetchProducts: async (page = 1) => {
     set({ isLoading: true, error: null });
     try {
-      const res = await api.get('/marketplace/products/', { params: { page, limit: 20 } });
+      const res = await api.get('/marketplace/products', { params: { page, limit: 20 } });
       const data = res.data;
       set((state) => ({
         products: page === 1 ? (data.products || data || []) : [...state.products, ...(data.products || [])],
@@ -66,7 +66,7 @@ export const useMarketplaceStore = create<MarketplaceState>()((set) => ({
   createProduct: async (data) => {
     set({ isLoading: true, error: null });
     try {
-      await api.post('/marketplace/products/', data);
+      await api.post('/marketplace/products', data);
       set({ isLoading: false });
     } catch (err) {
       set({ error: getErrorMessage(err), isLoading: false });
